@@ -1,6 +1,7 @@
 //  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 #include "kern_gen11.hpp"
+#include "i915_lrc_reg.hpp"
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -58,6 +59,208 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 // No separate kextIOAF2 registration needed here.
 
 Gen11 *Gen11::callback = nullptr;
+
+static constexpr uint32_t kGen11CsbWritePtrMask = 0xFu;
+static constexpr uint32_t kGen11CsbReadPtrMask  = 0xFu << 8;
+static uint32_t csbConsumeWritePtr(uint32_t value) {
+	const uint32_t write = value & kGen11CsbWritePtrMask;
+	return (kGen11CsbReadPtrMask << 16) | (write << 8);
+}
+
+static volatile UInt32 gIrqWatchdogStop = 1;
+static volatile UInt32 gIrqWatchdogActive = 0;
+static volatile UInt32 gIrqWatchdogPasses = 0;
+
+static volatile UInt32 gEmrEnforcerArmed = 0;
+static int gEmrCount = 0;
+
+static constexpr uint32_t kRenderWaMcrSelector   = 0xfdc;
+static constexpr uint32_t kRenderWaMcrMulticast  = 1u << 31;
+static constexpr uint32_t kRenderWaMcrSliceMask  = 0xfu << 27;
+static constexpr uint32_t kRenderWaMcrSubMask    = 0x7u << 24;
+static constexpr uint32_t kRenderWaDssEnable     = 0x913c;
+static constexpr uint32_t kRenderWaGarbcntl      = 0xb004;
+static constexpr uint32_t kRenderWaBusHashExc    = 1u << 7;
+static constexpr uint32_t kRenderWaRow2Bits      = GEN12_DISABLE_EARLY_READ | GEN12_PUSH_CONST_DEREF_HOLD_DIS;
+
+static void applyRenderWa(NGreen *cb, bool steer) {
+	if (cb == nullptr) return;
+	const uint32_t mcr = cb->readReg32(kRenderWaMcrSelector);
+	const uint32_t ffThr = cb->readReg32(GEN7_FF_THREAD_MODE);
+	const uint32_t garb = cb->readReg32(kRenderWaGarbcntl);
+	uint32_t steerTo = 0;
+	if (steer) {
+		const uint32_t dss = cb->readReg32(kRenderWaDssEnable);
+		const uint32_t ss = (dss != 0 && dss != 0xffffffffu) ? (static_cast<uint32_t>(__builtin_ctz(dss)) & 7u) : 0u;
+		steerTo = ss << 24;
+	}
+	const bool awake = ffThr != 0 && ffThr != 0xffffffffu && mcr != 0xffffffffu && garb != 0xffffffffu;
+	if (steer && awake) {
+		cb->writeReg32(kRenderWaMcrSelector, (mcr & ~(kRenderWaMcrSliceMask | kRenderWaMcrSubMask)) | steerTo);
+	}
+	cb->writeReg32(GEN9_CS_DEBUG_MODE1, (FF_DOP_CLOCK_GATE_DISABLE << 16) | FF_DOP_CLOCK_GATE_DISABLE);
+	cb->writeReg32(GEN8_CS_CHICKEN1, (GEN9_PREEMPT_GPGPU_LEVEL_MASK << 16) | GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL);
+	if (awake) cb->writeReg32(GEN7_FF_THREAD_MODE, ffThr | GEN12_FF_TESSELATION_DOP_GATE_DISABLE);
+	if (awake && garb != 0) cb->writeReg32(kRenderWaGarbcntl, garb & ~kRenderWaBusHashExc);
+	const uint32_t selNow = cb->readReg32(kRenderWaMcrSelector);
+	const bool mcOn = awake && selNow != 0xffffffffu && (selNow & kRenderWaMcrMulticast) != 0;
+	if (mcOn || (steer && awake && selNow != 0xffffffffu)) {
+		if (!mcOn) cb->writeReg32(kRenderWaMcrSelector, selNow | kRenderWaMcrMulticast);
+		cb->writeReg32(GEN8_ROW_CHICKEN2, (kRenderWaRow2Bits << 16) | kRenderWaRow2Bits);
+		cb->writeReg32(GEN9_ROW_CHICKEN4, (GEN12_DISABLE_TDL_PUSH << 16) | GEN12_DISABLE_TDL_PUSH);
+		cb->writeReg32(GEN10_SAMPLER_MODE, (ENABLE_SMALLPL << 16) | ENABLE_SMALLPL);
+		if (!mcOn) cb->writeReg32(kRenderWaMcrSelector, selNow);
+	}
+}
+
+static constexpr size_t   kCtxLrcBufOff   = 0x98;
+static constexpr size_t   kSharedBufVaOff = 0x38;
+static constexpr uint32_t kPoshSlot        = 0x35 + 1;
+
+static volatile uint32_t *lrcImageOf(void *ctx) {
+	if (ctx == nullptr) return nullptr;
+	auto *buf = *reinterpret_cast<void *volatile *>(
+	    static_cast<volatile uint8_t *>(ctx) + kCtxLrcBufOff);
+	if (buf == nullptr) return nullptr;
+	const uint64_t va = *reinterpret_cast<volatile const uint64_t *>(
+	    static_cast<volatile uint8_t *>(buf) + kSharedBufVaOff);
+	if ((va >> 47) != 0x1ffffull || (va & 0xfffull) != 0) return nullptr;
+	auto *img = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(va) + LRC_STATE_OFFSET);
+	if (img[CTX_CONTEXT_CONTROL - 1] != 0x2244u || img[CTX_RING_TAIL - 1] != 0x2030u || img[CTX_RING_START - 1] != 0x2038u)
+		return nullptr;
+	return img;
+}
+
+extern volatile uint64_t gStolenLo, gStolenHi;
+extern volatile uint32_t gStolenState;
+static inline void flushLines(volatile const void *p, uint32_t bytes) {
+	uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(63);
+	const uintptr_t end = reinterpret_cast<uintptr_t>(p) + bytes;
+	for (; a < end; a += 64) asm volatile("clflush (%0)" :: "r"(a) : "memory");
+	asm volatile("mfence" ::: "memory");
+}
+
+static constexpr uint32_t kPoshBit  = 0x00000010u;
+static constexpr uint32_t kPoshMask = 0x00100000u;
+static constexpr uint32_t kPoshReg  = 0x21b0u;
+
+static void applyPoshContextControl(NGreen *cb, void *ctx) {
+	if (cb == nullptr || ctx == nullptr) return;
+	volatile uint32_t *img = lrcImageOf(ctx);
+	if (img == nullptr) return;
+	const uint32_t cc = img[CTX_CONTEXT_CONTROL], reg = img[kPoshSlot - 1], posh = img[kPoshSlot];
+	if ((cc & kPoshBit) != 0 && reg == kPoshReg && posh != 0) {
+		img[CTX_CONTEXT_CONTROL] = (cc & 0xffefffefu) | kPoshMask;
+		__sync_synchronize();
+		flushLines(&img[CTX_CONTEXT_CONTROL], 4u);
+	}
+}
+
+enum : uint32_t { kWaMasked = 0, kWaField = 1, kWaOr = 2, kWaWrite = 3 };
+struct ContextWa { uint32_t reg, kind, clr, set; const char *name; };
+static constexpr uint32_t kWaCount = 7;
+static const ContextWa kContextWa[kWaCount] = {
+	{0x7304u, kWaMasked, 0u,   1u << 9,     "CSC3"},
+	{0x2580u, kWaField,  0x6u, 0x2u,        "CSCHK1"},
+	{0x6604u, kWaWrite,  ~0u,  0xe0040000u, "FFMODE2"},
+	{0x7018u, kWaMasked, 0u,   1u << 13,    "HIZ"},
+	{0x7300u, kWaMasked, 0u,   1u << 6,     "CSC4"},
+	{0x5584u, kWaOr,     0u,   1u << 5,     "WMCHK2"},
+	{0xe18cu, kWaMasked, 0u,   1u << 15,    "SMP"},
+};
+static uint32_t waNewValue(const ContextWa &w, uint32_t old) {
+	switch (w.kind) {
+	case kWaMasked: return old | w.set | (w.set << 16);
+	case kWaField:  return (old & ~w.clr) | w.set | (w.clr << 16);
+	case kWaOr:     return old | w.set;
+	default:          return w.set;
+	}
+}
+static void patchImageWa(volatile uint32_t *base, uint32_t ndw) {
+	uint32_t i = 0;
+	while (i < ndw) {
+		const uint32_t dw = base[i];
+		const uint32_t len = (dw & 0xffu) + 1u;
+		if ((dw >> 23) != 0x22u || len < 2u || (len & 1u) != 0 || i + 1u + len > ndw) { i++; continue; }
+		bool ok = true;
+		for (uint32_t j = 0; j < len && ok; j += 2) {
+			const uint32_t r = base[i + 1u + j];
+			ok = r != 0 && (r & 3u) == 0 && r < 0x40000u;
+		}
+		if (!ok) { i++; continue; }
+		for (uint32_t j = 0; j < len; j += 2) {
+			const uint32_t r = base[i + 1u + j];
+			for (uint32_t t = 0; t < kWaCount; t++) {
+				if (r != kContextWa[t].reg) continue;
+				const uint32_t vi = i + 2u + j;
+				const uint32_t nv = waNewValue(kContextWa[t], base[vi]);
+				if (nv != base[vi]) { base[vi] = nv; flushLines(&base[vi], 4u); }
+			}
+		}
+		i += 1u + len;
+	}
+}
+static void *volatile gSafeImagePtr = nullptr;
+
+static void applySafeImageWa(void *ctx) {
+	auto *accel = *reinterpret_cast<void *volatile *>(static_cast<volatile uint8_t *>(ctx) + 0x50);
+	auto *obj = accel ? *reinterpret_cast<OSObject *volatile *>(static_cast<volatile uint8_t *>(accel) + 0x1268) : nullptr;
+	if (obj == nullptr || obj == gSafeImagePtr) return;
+	gSafeImagePtr = obj;
+	auto *md = OSDynamicCast(IOBufferMemoryDescriptor, obj);
+	const uint8_t *bytes = md ? static_cast<const uint8_t *>(md->getBytesNoCopy()) : nullptr;
+	const size_t len = md ? md->getLength() : 0;
+	if (bytes == nullptr || len < LRC_STATE_OFFSET + 0x1000u) return;
+	auto *img = reinterpret_cast<volatile uint32_t *>(const_cast<uint8_t *>(bytes) + LRC_STATE_OFFSET);
+	if (img[CTX_CONTEXT_CONTROL - 1] != 0x2244u || img[CTX_RING_TAIL - 1] != 0x2030u || img[CTX_RING_START - 1] != 0x2038u) return;
+	patchImageWa(img, static_cast<uint32_t>((len - LRC_STATE_OFFSET) / 4u));
+}
+static void applyContextWa(NGreen *cb, void *ctx) {
+	if (cb == nullptr || ctx == nullptr) return;
+	applySafeImageWa(ctx);
+	volatile uint32_t *img = lrcImageOf(ctx);
+	auto *buf = *reinterpret_cast<void *volatile *>(static_cast<volatile uint8_t *>(ctx) + kCtxLrcBufOff);
+	const uint64_t size = buf ? getMember<uint64_t>(buf, 0x20) : 0;
+	if (img == nullptr || size < LRC_STATE_OFFSET + 0x1000u || size > 0x100000u) return;
+	patchImageWa(img, static_cast<uint32_t>((size - LRC_STATE_OFFSET) / 4u));
+}
+
+static IOSimpleLock *gCtxFreeLock = nullptr;
+static volatile uint32_t gCtxFreeRouted = 0;
+
+static inline void ctxFreeLock() { if (gCtxFreeLock != nullptr) IOSimpleLockLock(gCtxFreeLock); }
+static inline void ctxFreeUnlock() { if (gCtxFreeLock != nullptr) IOSimpleLockUnlock(gCtxFreeLock); }
+
+volatile uint64_t gStolenLo = 0, gStolenHi = 0;
+volatile uint32_t gStolenState = 0;
+
+static void initStolenRange() {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || gStolenState != 0) return;
+	const uint64_t size = cb->stolen_size != 0 ? cb->stolen_size : (128ull << 20);
+	const uint32_t g1 = cb->readReg32(GGTT_PTE_LO(1)), g2 = cb->readReg32(GGTT_PTE_LO(2)), g3 = cb->readReg32(GGTT_PTE_LO(3));
+	const uint32_t g1hi = cb->readReg32(GGTT_PTE_HI(1));
+	uint64_t ggttBase = 0;
+	if ((g1 & g2 & g3 & 1u) != 0 && g1hi == 0 && (g1 & 0xFFFFF000u) >= 0x101000u && (g2 & 0xFFFFF000u) == (g1 & 0xFFFFF000u) + 0x1000u && (g3 & 0xFFFFF000u) == (g1 & 0xFFFFF000u) + 0x2000u)
+		ggttBase = static_cast<uint64_t>(g1 & 0xFFFFF000u) - 0x1000ull;
+	if ((ggttBase & 0xFFFFFull) != 0) ggttBase = 0;
+	uint32_t dw0 = 0, dw1 = 0;
+	if (cb->gpuDevice() != nullptr) { dw0 = cb->gpuDevice()->configRead32(0xC0); dw1 = cb->gpuDevice()->configRead32(0xC4); }
+	const uint64_t bdsm = (dw0 != 0 && dw0 != 0xFFFFFFFFu && dw1 == 0) ? (dw0 & 0xFFF00000ull) : 0;
+	uint64_t lo = ggttBase, hi = ggttBase != 0 ? ggttBase + size : 0;
+	if (bdsm != 0) {
+		if (lo == 0 || bdsm < lo) lo = bdsm;
+		if (bdsm + size > hi) hi = bdsm + size;
+	}
+	gStolenLo = lo;
+	gStolenHi = hi;
+	gStolenState = lo != 0 ? 1u : 2u;
+}
+
+static bool isStolen(uint64_t pa) {
+	if (gStolenState == 0) initStolenRange();
+	return gStolenState == 1 ? (pa >= gStolenLo && pa < gStolenHi) : pa < (1ull << 32);
+}
 
 static bool isExpectedTGLDebugFramebuffer(mach_vm_address_t address, size_t size) {
 	struct Anchor {
@@ -1548,10 +1751,26 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		const bool wegCoexist = isWEGCoexistMode();
 		const bool forceFullMTL = shouldForceFullMetalPath();
 
+		{
+			SolveRequestPlus enableSolve[] = {
+				{"__ZN11IGScheduler33enablePeriodicEventTimerInterruptEP22IOInterruptEventSource",
+				 this->oIGSchedEnablePeriodic},
+			};
+			SolveRequestPlus::solveAll(patcher, index, enableSolve, address, size);
+
+			RouteRequestPlus finishTimerRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer521registerForInterruptsEv",
+				 wrapHWCS5RegisterForInterrupts, this->oHWCS5RegisterForInterrupts},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, finishTimerRoute, address, size)) {
+				patcher.clearError();
+			}
+		}
+
 		[&, this]() __attribute__((noinline)) {
 		RouteRequestPlus requests[] = {
 			
-			 {"__ZN16IntelAccelerator20_PAVPCommandCallbackEP8OSObject22PAVPSessionCommandID_tjPj", wrapPavpSessionCallback, this->orgPavpSessionCallback},
+			 {"__ZN16IntelAccelerator20_PAVPCommandCallbackEP8OSObject22PAVPSessionCommandID_tjPj", wrapPavpCommandCallbackObj, this->orgPavpCommandCallbackObj},
 			
 			// V163: Hook startGraphicsEngine to clear PERCTX_PREEMPT_CTRL (FF_SLICE_CS_CHICKEN1 bit 14)
 			// immediately after the TGL kext enables it. The TGL kext writes 0x40004000 to reg 0x20E0
@@ -1670,6 +1889,16 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 		}();
+		{
+			if (gCtxFreeLock == nullptr) gCtxFreeLock = IOSimpleLockAlloc();
+			RouteRequestPlus ctxFreeRoute[] = {
+				{"__ZN17IGHardwareContext4freeEv", wrapContextFree, this->oContextFree},
+			};
+			if (gCtxFreeLock != nullptr && RouteRequestPlus::routeAll(patcher, index, ctxFreeRoute, address, size))
+				gCtxFreeRouted = 1;
+			else
+				patcher.clearError();
+		}
 
 		{
 			RouteRequestPlus startRoute[] = {
@@ -1704,6 +1933,13 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			} else {
 				SYSLOG("ngreen", "V111: IGAccelDevice::deviceStart symbol not found — relying on binary patch");
 			}
+		}
+
+		{
+			RouteRequestPlus fwReentRoute[] = {
+				{"__ZN16IntelAccelerator13SafeForceWakeEbj", wrapSafeForceWakeReent, this->oSafeForceWakeReent},
+			};
+			RouteRequestPlus::routeAll(patcher, index, fwReentRoute, address, size);
 		}
 
 		if (!wegCoexist || forceFullMTL) {
@@ -4944,8 +5180,23 @@ int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIn
 static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs);
 static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs);
 
+struct DelayedServiceCall {
+	IOService *service;
+	thread_call_t call;
+	unsigned delayMs;
+};
+
 unsigned long Gen11::start(void *that,void  *param_1)
 {
+	static uint32_t startCount = 0;
+	const uint32_t startIndex = __sync_fetch_and_add(&startCount, 1);
+	const bool irqWatchdogQuiesceOwner = startIndex == 0 && !NGreen::callback->isRealTGL;
+	if (irqWatchdogQuiesceOwner) {
+		__sync_lock_test_and_set(&gIrqWatchdogStop, 0u);
+		__sync_lock_test_and_set(&gIrqWatchdogActive, 0u);
+		__sync_lock_test_and_set(&gIrqWatchdogPasses, 0u);
+		Gen11::gGfxAccelStartDone = false;
+	}
 	// V44: Configurable scheduler type.
 	// populateAccelConfig reads "GraphicsSchedulerSelect" from the IORegistry.
 	// Types: 3=IGGuC (firmware), 4=IGScheduler4, 5=IGScheduler5 (host preemptive).
@@ -4986,11 +5237,18 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		}
 	}
 
-	// Inject MultiForceWakeSelect=1 into Development dictionary.
+	// Inject MultiForceWakeSelect=1 and CsbProcModeSelect=1, directly and into the Development dictionary.
 	// This tells the accelerator to use SafeForceWakeMultithreaded (which we hook)
 	// instead of the framebuffer's SafeForceWake (which fails on RPL-P with ACK=0).
 	// V52: Only needed on RPL — real TGL's native ForceWake works fine.
 	if (!NGreen::callback->isRealTGL) {
+		auto *directNum = OSNumber::withNumber(1ULL, 32);
+		if (directNum) {
+			service->setProperty("MultiForceWakeSelect", directNum);
+			service->setProperty("CsbProcModeSelect", directNum);
+			directNum->release();
+		}
+
 	auto *devDict = OSDynamicCast(OSDictionary, service->getProperty("Development"));
 	if (devDict) {
 		auto *newDevDict = OSDictionary::withDictionary(devDict);
@@ -4998,27 +5256,31 @@ unsigned long Gen11::start(void *that,void  *param_1)
 			auto *num = OSNumber::withNumber(1ULL, 32);
 			if (num) {
 				newDevDict->setObject("MultiForceWakeSelect", num);
+					newDevDict->setObject("CsbProcModeSelect", num);
 				num->release();
 			}
 			service->setProperty("Development", newDevDict);
 			newDevDict->release();
-			SYSLOG("ngreen", "Injected MultiForceWakeSelect=1 into Development dict");
 		}
 	} else {
-		SYSLOG("ngreen", "No Development dict found, creating one with MultiForceWakeSelect=1");
 		auto *newDevDict = OSDictionary::withCapacity(4);
 		if (newDevDict) {
 			auto *num = OSNumber::withNumber(1ULL, 32);
 			if (num) {
 				newDevDict->setObject("MultiForceWakeSelect", num);
+					newDevDict->setObject("CsbProcModeSelect", num);
 				num->release();
 			}
 			service->setProperty("Development", newDevDict);
 			newDevDict->release();
 		}
 	}
-	} else {
-		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
+	}
+
+	if (IS_RAPTOR_LAKE_HX()) {
+		auto *zero = OSNumber::withNumber(0ULL, 32);
+		if (zero != nullptr) service->setProperty("EnableMultiContext", zero);
+		OSSafeReleaseNULL(zero);
 	}
 
 	// ── V29: Apply GT workarounds + GGTT PTE diagnostics ──
@@ -5037,6 +5299,7 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	
 	// ── V29 NEW: Pre-start GGTT PTE dump ──
 	// Dump first few GGTT PTEs to verify format
+	initStolenRange();
 	SYSLOG("ngreen", "GGTT PTE format check (first 4 pages):");
 	for (int i = 0; i < 4; i++) {
 		SYSLOG("ngreen", "  GGTT[%d]=0x%08x:%08x", i,
@@ -5124,18 +5387,10 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	uint32_t misccpctl = NGreen::callback->readReg32(GEN7_MISCCPCTL);
 	misccpctl &= ~GEN12_DOP_CLOCK_GATE_RENDER_ENABLE;
 	NGreen::callback->writeReg32(GEN7_MISCCPCTL, misccpctl);
-	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(RENDER_RING_BASE), IECPUNIT_CLKGATE_DIS);
-	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(BLT_RING_BASE), IECPUNIT_CLKGATE_DIS);
-	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(GEN11_VEBOX_RING_BASE), IECPUNIT_CLKGATE_DIS);
+	applyRenderWa(NGreen::callback, true);
 	NGreen::callback->wa_mcr_write_or(GEN10_DFR_RATIO_EN_AND_CHICKEN, DFR_DISABLE);
 	NGreen::callback->wa_masked_en(GEN11_COMMON_SLICE_CHICKEN3,
 			GEN12_DISABLE_CPS_AWARE_COLOR_PIPE);
-	NGreen::callback->wa_masked_field_set(GEN8_CS_CHICKEN1,
-				GEN9_PREEMPT_GPGPU_LEVEL_MASK,
-				GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL);
-	uint32_t mcr = GEN8_MCR_SLICE(0) | GEN8_MCR_SUBSLICE(0);
-	uint32_t mcr_mask = GEN8_MCR_SLICE_MASK | GEN8_MCR_SUBSLICE_MASK;
-	NGreen::callback->wa_write_clr_set(GEN8_MCR_SELECTOR, mcr_mask, mcr);
 	// V162: PERCTX_PREEMPT_CTRL (bit 14) is a TGL-specific workaround that bakes
 	// into the execlist context image template.  On RPL the bit freezes the EU
 	// thread dispatcher on the first Metal context-image DMA restore.  Only enable
@@ -5185,14 +5440,12 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	}
 	
 	// V54: Schedule IRQ watchdog timer — re-enables Master IRQ every 2s during start().
-	// The driver's interrupt setup may disable it during init; we keep re-enabling.
-	// Real TGL keeps native behavior; spoof path always needs this.
-	if (!NGreen::callback->isRealTGL) {
+	if (irqWatchdogQuiesceOwner) {
 		auto timerCall = thread_call_allocate(v54IrqWatchdog, nullptr);
 		if (timerCall) {
 			uint64_t deadline;
 			clock_interval_to_deadline(2, kSecondScale, &deadline);
-			thread_call_enter_delayed(timerCall, deadline);
+			thread_call_enter1_delayed(timerCall, timerCall, deadline);
 			SYSLOG("ngreen", "V54: IRQ watchdog armed — will re-enable Master IRQ every 2s");
 		}
 	}
@@ -5236,10 +5489,16 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	}
 
 	auto ret= FunctionCast(start, callback->ostart)(that,param_1);
+	if (irqWatchdogQuiesceOwner) {
+		__sync_lock_test_and_set(&gIrqWatchdogStop, 1u);
+		__sync_synchronize();
+		while (__sync_fetch_and_or(&gIrqWatchdogActive, 0u) != 0) {
+			IOSleep(1);
+		}
+	}
 
 	// V221: Signal waitForStamp hook that the GFX interrupt handler is now installed.
-	Gen11::gGfxAccelStartDone = true;
-	SYSLOG("ngreen", "V221: GFX start() complete — gGfxAccelStartDone=true ret=%lu", ret);
+	Gen11::gGfxAccelStartDone = ret != 0;
 
 	// V65: IMMEDIATELY after original start() returns, re-enable RCS0 interrupts.
 	// Apple's init code may have overwritten our pre-start settings.
@@ -5267,11 +5526,12 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		// RING_MODE uses the Intel masked-write convention: hi16=write-enable mask, lo16=values.
 		// Writing 0x80008000 sets bit15 (GFX_RUN_LIST_ENABLE) without touching other bits.
 		{
-			uint32_t rmPre = NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE));
-			NGreen::callback->writeReg32(RING_MODE(RENDER_RING_BASE), 0x80008000u);
-			uint32_t rmPost = NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE));
-			SYSLOG("ngreen", "V507: RING_MODE 0x%08x → 0x80008000 → readback 0x%08x (GFX_RUN_LIST_ENABLE=%d)",
-				rmPre, rmPost, !!(rmPost & (1u << 15)));
+			NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
+			IODelay(1000);
+			uint64_t forceWakeNow = 0, forceWakeDeadline = 0;
+			clock_interval_to_deadline(50, kMillisecondScale, &forceWakeDeadline);
+			for (clock_get_uptime(&forceWakeNow); forceWakeNow < forceWakeDeadline; clock_get_uptime(&forceWakeNow))
+				if (NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & 1) break;
 		}
 	}
 	
@@ -5280,7 +5540,6 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 1);
 	IODelay(1000);
 	
-	SYSLOG("ngreen", "start() returned %d", ret);
 	
 	// V43: Scheduler type diagnostic — read field_1190 bits 23-25
 	{
@@ -5363,8 +5622,6 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "RCS0 RING_FAULT=0x%x",
-		NGreen::callback->readReg32(RING_FAULT_REG(RENDER_RING_BASE)));
 	
 	// Global errors
 	SYSLOG("ngreen", "ERROR_GEN6=0x%x RING_FAULT(global)=0x%x",
@@ -5408,7 +5665,6 @@ unsigned long Gen11::start(void *that,void  *param_1)
 
 	// CSB entries
 	uint32_t csp = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
-	SYSLOG("ngreen", "CSB wr_ptr=%d rd_ptr=%d", (csp >> 8) & 0x7, csp & 0x7);
 	for (int i = 0; i < 6; i++) {
 		SYSLOG("ngreen", "CSB[%d]=0x%x:%08x", i,
 			NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF_HI(RENDER_RING_BASE, i)),
@@ -5612,12 +5868,6 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V45: post-registerService state=0x%llx (reg=%d match=%d)",
 			   (unsigned long long)svcState, !!(svcState & 0x02), !!(svcState & 0x04));
 		
-		// V110: V59 delayed child checks + V74 EMR enforcer run unconditionally for
-		// non-real TGL. Without V59, IGAccelDevice stays at state=0x0, WindowServer
-		// never opens IOAccelDisplayPipeUserClient2, and the display pipe never activates.
-		// V74 keeps EMR masked so Apple can't re-enable error interrupts behind our back.
-		// V60 health monitor (which contains V77 DisplayPipe killer) remains opt-in via
-		// -ngreenexp — without it, the display pipe is not terminated after opening.
 		if (!NGreen::callback->isRealTGL) {
 			// 8. V59: Schedule delayed child checks to rescue stuck IGAccelDevice children.
 			v45ScheduleDelayedCheck(that, 3000);
@@ -5628,22 +5878,20 @@ unsigned long Gen11::start(void *that,void  *param_1)
 			v45ScheduleDelayedCheck(that, 60000);
 			v45ScheduleDelayedCheck(that, 120000);
 			SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
-			// V74: Start PERMANENT EMR enforcer — 50ms interval, runs forever.
-			// Required: keeps EMR masked so Apple can't re-enable error interrupts.
-			// Without this the display pipe fails to activate entirely (all-black screen).
-			{
-				SYSLOG("ngreen", "V74: config maskWrites=1 v116Reenforce=1 maxIters=unlimited");
+			if (__sync_bool_compare_and_swap(&gEmrEnforcerArmed, 0u, 1u)) {
 				auto *emrSvc = static_cast<IOService *>(that);
 				emrSvc->retain();
+				gEmrCount = 0;
 				auto emrTimer = thread_call_allocate(v71EmrEnforcer,
 								 static_cast<thread_call_param_t>(emrSvc));
 				if (emrTimer) {
 					uint64_t deadline;
 					clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-					thread_call_enter_delayed(emrTimer, deadline);
+					thread_call_enter1_delayed(emrTimer, emrTimer, deadline);
 					SYSLOG("ngreen", "V74: EMR enforcer armed — 50ms interval, PERMANENT");
 				} else {
 					emrSvc->release(); // alloc failed — drop our retain
+					__sync_lock_test_and_set(&gEmrEnforcerArmed, 0u);
 				}
 			}
 
@@ -5692,7 +5940,6 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(BLT_RING_BASE + 0x358));
 	
 	// ── V50: Log Metal-readiness summary ──
-	SYSLOG("ngreen", "V50: start() ret=%d — policy: TGL from /Library/Extensions, fallback ICL from /System/Library/Extensions", ret);
 	SYSLOG("ngreen", "V50: Metal ON. ICL f2 mask-based (fallback). Use -ngreenNoMetal for display-only.");
 	SYSLOG("ngreen", "V50: active GPU plugin track = %s (TGL and ICL both supported)",
 	       (callback && callback->tglHWLoaded) ? "TGL" : "ICL");
@@ -5745,12 +5992,8 @@ unsigned long Gen11::start(void *that,void  *param_1)
 			SYSLOG("ngreen", "V51: cleared TLB_FAULT data0=0x%x data1=0x%x", tlb0, tlb1);
 		}
 		
-		// 5. Clear GT interrupt identity (W1C) so stale interrupts don't confuse scheduler
 		uint32_t gtIntr0 = NGreen::callback->readReg32(GEN11_GT_INTR_DW0);
 		uint32_t gtIntr1 = NGreen::callback->readReg32(GEN11_GT_INTR_DW1);
-		if (gtIntr0) NGreen::callback->writeReg32(GEN11_GT_INTR_DW0, gtIntr0);
-		if (gtIntr1) NGreen::callback->writeReg32(GEN11_GT_INTR_DW1, gtIntr1);
-		SYSLOG("ngreen", "V51: cleared GT_INTR DW0=0x%x DW1=0x%x", gtIntr0, gtIntr1);
 	}
 	
 	// ── V51: BCS engine stop+clear ──
@@ -5924,6 +6167,14 @@ IOReturn Gen11::wrapPavpSessionCallback( void *intelAccelerator, int32_t session
 	return FunctionCast(wrapPavpSessionCallback, callback->orgPavpSessionCallback)(intelAccelerator, sessionCommand, sessionAppId, a4, flag);
 }
 
+IOReturn Gen11::wrapPavpCommandCallbackObj(void *intelAccelerator, OSObject *owner, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4) {
+	if (sessionCommand == 4) {
+		return kIOReturnSuccess;
+	}
+
+	return FunctionCast(wrapPavpCommandCallbackObj, callback->orgPavpCommandCallbackObj)(intelAccelerator, owner, sessionCommand, sessionAppId, a4);
+}
+
 void Gen11::getGPUInfoICL(void *that)
 {
 	FunctionCast(getGPUInfoICL, callback->ogetGPUInfoICL)(that);
@@ -6003,6 +6254,15 @@ void Gen11::getGPUInfo(void *that)
 
 }
 
+void Gen11::wrapContextFree(void *that)
+{
+	auto *cb = NGreen::callback;
+	ctxFreeLock();
+	if (cb != nullptr && that != nullptr && that == cb->lastRCSCtx) cb->lastRCSCtx = nullptr;
+	ctxFreeUnlock();
+	FunctionCast(wrapContextFree, callback->oContextFree)(that);
+}
+
 // V164: Hook populateResetRegisterList to clear PERCTX_PREEMPT_CTRL before snapshot.
 //
 // IntelAccelerator::startGraphicsEngine writes 0x40004000 to 0x20E0, then calls
@@ -6015,14 +6275,6 @@ void Gen11::getGPUInfo(void *that)
 // making the replay batch write 0x0000 to 0x20E0 on every context switch instead.
 void Gen11::populateResetRegisterList(void *that)
 {
-	if (!NGreen::callback->isRealTGL) {
-		// Masked clear: mask=bit14, value=0 → 0x40000000
-		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
-			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
-		SYSLOG("ngreen", "V164: pre-snapshot clear FF_SLICE_CS_CHICKEN1=0x%08x",
-			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1));
-
-	}
 	FunctionCast(populateResetRegisterList, callback->opopulateResetRegisterList)(that);
 
 	// V503: Dump the exact values Apple just baked into the context reset register list.
@@ -6077,27 +6329,7 @@ void Gen11::populateResetRegisterList(void *that)
 				entry[1] = 0x00000002;
 				if (v504Verbose) SYSLOG("ngreen", "V504[%d]: patched CS_CHICKEN1 → 0x2", v504CallCount);
 			}
-			// V506: The populateResetRegisterList snapshot reads RING_MODE before Apple enables
-			// GFX_RUN_LIST_ENABLE (bit 15), so the baked value is 0x0.  On first lite-restore
-			// the MI_LRI replays RING_MODE=0, which clears GFX_RUN_LIST_ENABLE mid-restore —
-			// the ExecList state machine disables itself and the context never reaches ACTIVE.
-			// Fix: force bit 15 in the image so every context restore re-arms ExecList mode.
-			if (addr == 0x229c) {
-				uint32_t old = entry[1];
-				entry[1] |= (1u << 15);  // GFX_RUN_LIST_ENABLE
-				if (v504Verbose) SYSLOG("ngreen", "V504[%d]: V506 RING_MODE 0x%08x → 0x%08x (GFX_RUN_LIST_ENABLE forced)",
-					v504CallCount, old, entry[1]);
 			}
-		}
-	}
-	// V507: Re-arm GFX_RUN_LIST_ENABLE in the live register after each reset/recovery attempt.
-	// Apple's recovery may clear RING_MODE; ensure ExecList mode stays on before context re-submit.
-	{
-		uint32_t rmPre = NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE));
-		NGreen::callback->writeReg32(RING_MODE(RENDER_RING_BASE), 0x80008000u);
-		uint32_t rmPost = NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE));
-		SYSLOG("ngreen", "V507: post-resetRegList RING_MODE 0x%08x → readback 0x%08x (GFX_RUN_LIST_ENABLE=%d)",
-			rmPre, rmPost, !!(rmPost & (1u << 15)));
 	}
 
 	// V507 LRCA repair: re-copy the ring-LRI from the saved RCS context buffer to the
@@ -6105,7 +6337,10 @@ void Gen11::populateResetRegisterList(void *that)
 	// The display retry loop reuses the same context without calling withOptions again,
 	// so the slot gets wiped by stopGraphicsEngine and never repaired by V508.
 	auto *cb = NGreen::callback;
+	if (!cb->isRealTGL) cb->setApertureIfNecessary();
+	ctxFreeLock();
 	void *ctx = cb->lastRCSCtx;
+	if (!gCtxFreeRouted) ctx = nullptr;
 	if (!cb->isRealTGL && ctx) {
 		uint32_t lrcaGpuVa = getMember<uint32_t>(ctx, 0x89) & 0xFFFFF000;
 		if (lrcaGpuVa) {
@@ -6147,6 +6382,7 @@ void Gen11::populateResetRegisterList(void *that)
 			}
 		}
 	}
+	ctxFreeUnlock();
 }
 
 void *Gen11::createUserGPUTask(void *that)
@@ -6575,14 +6811,6 @@ unsigned long Gen11::startGraphicsEngine(void *that)
 
 	unsigned long ret = FunctionCast(startGraphicsEngine, callback->ostartGraphicsEngine)(that);
 
-	if (!NGreen::callback->isRealTGL) {
-		// Masked clear: mask=bit14, value=0 → 0x40000000
-		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
-			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
-		SYSLOG("ngreen", "V163: startGraphicsEngine post-clear FF_SLICE_CS_CHICKEN1=0x%08x (ret=%lu)",
-			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1), ret);
-	}
-
 	return ret;
 }
 
@@ -6609,23 +6837,13 @@ void Gen11::applyPreStopEngineWorkarounds(int callCount)
 {
 	// ── GT workarounds (gen12_gt_workarounds_init / rcs_engine_wa_init) ──
 	// Applied on every reset — same set as Linux i915 for TGL/ADL-P.
-	/* Wa_14011060649:tgl,rkl,dg1,adl-s,adl-p */
-	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(RENDER_RING_BASE), IECPUNIT_CLKGATE_DIS);
-	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(BLT_RING_BASE),    IECPUNIT_CLKGATE_DIS);
-	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(GEN11_VEBOX_RING_BASE), IECPUNIT_CLKGATE_DIS);
+	applyRenderWa(NGreen::callback, true);
 	/* Wa_14011059788:tgl,rkl,adl-s,dg1,adl-p */
 	NGreen::callback->wa_mcr_write_or(GEN10_DFR_RATIO_EN_AND_CHICKEN, DFR_DISABLE);
 	/* Wa_14015795083 */
 	NGreen::callback->wa_add(GEN7_MISCCPCTL, GEN12_DOP_CLOCK_GATE_RENDER_ENABLE, 0, 0, false);
 	/* Wa_1409142259:tgl,dg1,adl-p */
 	NGreen::callback->wa_masked_en(GEN11_COMMON_SLICE_CHICKEN3, GEN12_DISABLE_CPS_AWARE_COLOR_PIPE);
-	/* WaDisableGPGPUMidThreadPreemption:gen12 */
-	NGreen::callback->wa_masked_field_set(GEN8_CS_CHICKEN1,
-			GEN9_PREEMPT_GPGPU_LEVEL_MASK, GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL);
-	/* MCR selector: slice 0, subslice 0 */
-	NGreen::callback->wa_write_clr_set(GEN8_MCR_SELECTOR,
-			GEN8_MCR_SLICE_MASK | GEN8_MCR_SUBSLICE_MASK,
-			GEN8_MCR_SLICE(0) | GEN8_MCR_SUBSLICE(0));
 	/* rcs_engine_wa_init */
 	NGreen::callback->wa_masked_en(GEN7_FF_SLICE_CS_CHICKEN1, GEN9_FFSC_PERCTX_PREEMPT_CTRL);
 
@@ -6660,11 +6878,10 @@ void Gen11::applyPreStopEngineWorkarounds(int callCount)
 // stopGraphicsEngine is the real GPU reset entry point on this binary (resetGraphicsEngine
 // symbol is absent). Stop-specific: ring snapshot, V155 save/restore, V162 PERCTX clear,
 // V71 POST CSB drain. GT workarounds are in applyPreStopEngineWorkarounds() above.
-unsigned long Gen11::stopGraphicsEngine(void *that)
+bool Gen11::stopGraphicsEngine(void *that)
 {
 	static int   v63ResetCount            = 0;
 	static uint32_t v155SavedRcsCtl       = 0;
-	static int   v164GdrstCount           = 0;
 	static int   v505Count                = 0;
 
 	if (!NGreen::callback->isRealTGL) {
@@ -6705,7 +6922,8 @@ unsigned long Gen11::stopGraphicsEngine(void *that)
 				uint64_t physBase = ((uint64_t)rpteHi << 32) | (rpteLo & 0xFFFFF000u);
 				SYSLOG("ngreen", "V505[%d]: ring phys=0x%llx HEAD=0x%x TAIL=0x%x — 32 dwords:",
 					   v505Count, (unsigned long long)physBase, rcsHead, rcsTail);
-				for (int i = 0; i < 32; i++) {
+				const bool stolen = isStolen(physBase);
+				for (int i = 0; i < 32 && !stolen; i++) {
 					uint32_t dw = IOMappedRead32(physBase + (uint64_t)(i * 4));
 					SYSLOG("ngreen", "V505[%d]:  [%02d] +0x%02x = 0x%08x", v505Count, i, i * 4, dw);
 				}
@@ -6714,27 +6932,9 @@ unsigned long Gen11::stopGraphicsEngine(void *that)
 			}
 		}
 
-		// V164: fire GDRST if ghost context detected (EXEC active, ring empty)
-		{
-			uint32_t execStatus = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
-			const bool ghostActive = (execStatus & 1) && (rcsHead == rcsTail);
-			if (ghostActive && v164GdrstCount < 8) {
-				v164GdrstCount++;
-				NGreen::callback->writeReg32(GEN6_GDRST, GEN6_GRDOM_RENDER);
-				uint32_t gdrstVal = GEN6_GRDOM_RENDER;
-				int pollCount = 0;
-				while ((gdrstVal & GEN6_GRDOM_RENDER) && pollCount < 1000) {
-					gdrstVal = NGreen::callback->readReg32(GEN6_GDRST);
-					pollCount++;
-				}
-				SYSLOG("ngreen", "V164[%d]: GDRST #%d poll=%d gdrst=0x%x EXEC 0x%x->0x%x",
-					v63ResetCount, v164GdrstCount, pollCount, gdrstVal,
-					execStatus, NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)));
-			}
-		}
 	}
 
-	unsigned long ret = FunctionCast(stopGraphicsEngine, callback->ostopGraphicsEngine)(that);
+	bool ret = FunctionCast(stopGraphicsEngine, callback->ostopGraphicsEngine)(that);
 
 	if (!NGreen::callback->isRealTGL) {
 		// V53/V161 POST: snapshot after stop
@@ -6744,10 +6944,6 @@ unsigned long Gen11::stopGraphicsEngine(void *that)
 			NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
 			NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
 			NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)));
-
-		// V162: clear PERCTX_PREEMPT_CTRL after stop — TGL context image sets bit 14, RPL hangs
-		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
-				(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
 
 		// V155: restore RCS ring enable so Apple's startGraphicsEngine can take over
 		if (v155SavedRcsCtl != 0)
@@ -6764,11 +6960,11 @@ unsigned long Gen11::stopGraphicsEngine(void *that)
 			NGreen::callback->writeReg32(RING_EMR(BLT_RING_BASE),    0xFFFFFFFF);
 			// Drain CSB: advance read pointer to write pointer
 			uint32_t csbReg   = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
-			uint32_t csbWrite = (csbReg >> 8) & 0xff;
-			uint32_t csbRead  = csbReg & 0xff;
+			uint32_t csbWrite = csbReg & kGen11CsbWritePtrMask;
+			uint32_t csbRead  = (csbReg & kGen11CsbReadPtrMask) >> 8;
 			if (csbRead != csbWrite)
 				NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE),
-											 (csbWrite << 8) | csbWrite);
+											 csbConsumeWritePtr(csbReg));
 			SYSLOG("ngreen", "V160[%d]: CSB rp %d→%d EXEC=0x%x FF_CS_CHKN1=0x%08x",
 				v63ResetCount, csbRead, csbWrite,
 				NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)),
@@ -6814,6 +7010,8 @@ uint64_t Gen11::IGHardwareContextinitWithOptions(void *that, void *task, const v
 	if (cb->isRealTGL || !ret) return ret;
 
 	uint8_t engType = getMember<uint8_t>(that, 0x6c);
+	if (engType == 0) applyPoshContextControl(cb, that);
+	if (engType == 0) applyContextWa(cb, that);
 	if (engType != 0) return ret;  // only repair RCS (case 0)
 
 	// LRCA GPU VA is stored at this+0x89 (4-byte field, written by initWithOptions success path).
@@ -6963,7 +7161,9 @@ void *Gen11::IGHardwareContextwithOptions(void *task, const void *params, uint8_
 	cb->writeReg32(0x101008, 0x1);
 	for (int i = 0; i < 96; i++) buf[i] = ap[i];
 
-	if (v508Count <= 4) {
+	static uint32_t pageDumpRows = 0;
+	const bool pageDumpLog = ++pageDumpRows <= 4;
+	if (pageDumpLog) {
 		SYSLOG("ngreen", "V508: ctx  pg1 DW0..7: %08x %08x %08x %08x  %08x %08x %08x %08x",
 		       buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
 	}
@@ -6973,7 +7173,7 @@ void *Gen11::IGHardwareContextwithOptions(void *task, const void *params, uint8_
 	cb->writeReg32(GGTT_PTE_HI(0), slotHi);
 	cb->writeReg32(0x101008, 0x1);
 
-	if (v508Count <= 4) {
+	if (pageDumpLog) {
 		SYSLOG("ngreen", "V508: slot pg1 DW0..7: %08x %08x %08x %08x  %08x %08x %08x %08x",
 		       ap[0], ap[1], ap[2], ap[3], ap[4], ap[5], ap[6], ap[7]);
 	}
@@ -7889,6 +8089,20 @@ IOReturn Gen11::wrapFBClientDoAttribute(void *fbclient, uint32_t attribute, unsi
 		return kIOReturnUnsupported;
 	}
 	return FunctionCast(wrapFBClientDoAttribute, callback->orgFBClientDoAttribute)(fbclient, attribute, unk1, unk2, unk3, unk4,  externalMethodArguments);
+}
+
+static constexpr uint32_t kFwAckLockedUs  = 500;
+static volatile void    *gFwOwnerThread   = nullptr;
+
+void Gen11::wrapSafeForceWakeReent(void *that, bool wake, uint32_t domain) {
+	void *self = reinterpret_cast<void *>(IOThreadSelf());
+	if (gFwOwnerThread == self) {
+		forceWake(that, wake, domain, 2);
+		return;
+	}
+	const bool claimed = __sync_bool_compare_and_swap(&gFwOwnerThread, nullptr, self);
+	FunctionCast(wrapSafeForceWakeReent, callback->oSafeForceWakeReent)(that, wake, domain);
+	if (claimed) gFwOwnerThread = nullptr;
 }
 
 unsigned long Gen11::loadGuCBinary(void *that) {
@@ -9173,17 +9387,24 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 //
 // HOW: Apple writes EMR via direct GT MMIO (not through the hookable WriteRegister32
 // vtable), so we cannot intercept it. Instead we poll every 50ms and correct any
-// deviation. The timer re-arms itself indefinitely; it stops only if MMIO becomes
-// invalid (GPU teardown). Each timer instance holds a retain on the IOService and
-// transfers it to the next allocation to avoid UAF.
+// deviation. The timer re-enters its own thread call indefinitely; when MMIO becomes
+// invalid (GPU teardown) or the service goes inactive it frees the call and drops the
+// one retain it holds on the IOService.
 //
 // WHAT it does each tick:
 //   1. Force RING_EMR(RCS) and RING_EMR(BCS) to 0xFFFFFFFF (all errors masked).
 //   2. Clear ERROR_GEN6 if non-zero.
 //   3. Re-enforce GGTT[0] → safe wired dummy page (V116, see below).
 void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param1) {
-	static int v71Count = 0;
-	v71Count++;
+	auto *emrSvc = static_cast<IOService *>(param0);
+	auto self = static_cast<thread_call_t>(param1);
+	const int v71Count = ++gEmrCount;
+	if (!emrSvc || emrSvc->isInactive() || !NGreen::callback || !NGreen::callback->mmioValid()) {
+		if (self) thread_call_free(self);
+		if (emrSvc) emrSvc->release();
+		__sync_lock_test_and_set(&gEmrEnforcerArmed, 0u);
+		return;
+	}
 
 	// V74 EMR-mask portion REMOVED (was: every 50ms force RING_EMR(RCS) and RING_EMR(BCS)
 	// to 0xFFFFFFFF, clear ERROR_GEN6). Pair-mate to V72R/V72W/V72F. With those three
@@ -9261,27 +9482,9 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 		}
 	}
 
-	// V74: Re-arm FOREVER — never stop. 50ms interval.
-	// Each timer holds a retain on the IOService (param0). Pass the retain to the
-	// next timer so the IOService stays alive. If MMIO is gone (GPU tore down),
-	// stop re-arming and release the last retain to avoid UAF.
-	auto *emrSvc = static_cast<IOService *>(param0);
-	if (!NGreen::callback->mmioValid()) {
-		// GPU torn down — stop timer loop and release the retain we hold.
-		SYSLOG("ngreen", "V74E[%d]: MMIO gone, stopping EMR enforcer", v71Count);
-		emrSvc->release();
-		return;
-	}
-	auto nextTimer = thread_call_allocate(v71EmrEnforcer, param0);
-	if (nextTimer) {
 		uint64_t deadline;
 		clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-		thread_call_enter_delayed(nextTimer, deadline);
-		// retain is transferred to the next timer — do NOT release here
-	} else {
-		// alloc failed — stop loop and release our retain
-		emrSvc->release();
-	}
+	thread_call_enter1_delayed(self, self, deadline);
 }
 
 // V85: Static member definitions for persistent FB mapping
@@ -9296,11 +9499,82 @@ uint64_t Gen11::v116DummyPhys = 0;
 // to block CoreDisplay's stamp-3 wait until the GFX interrupt handler is installed.
 volatile bool Gen11::gGfxAccelStartDone = false;
 
+static constexpr size_t   kHWCS5HwspPtrOffset   = 0x68;
+
+static constexpr uint32_t kRcsMaxStreamers = 8;
+
+struct RcsStreamer {
+	void     *cs;
+	void     *hwsp;
+	uint64_t  hwspPhys;
+};
+static RcsStreamer      gRcsStreamers[kRcsMaxStreamers] = {};
+static volatile uint32_t gRcsCount     = 0;
+
+void *gFinishTimerCommandStreamer = nullptr;
+void *gFinishTimerScheduler       = nullptr;
+
+static constexpr size_t kHWCS5SchedulerOffset   = 0x20;
+static constexpr size_t kHWCS5FinishSourceOffset = 0x1c08;
+
+void Gen11::wrapHWCS5RegisterForInterrupts(void *that) {
+	FunctionCast(wrapHWCS5RegisterForInterrupts,
+	             callback->oHWCS5RegisterForInterrupts)(that);
+
+	if (that == nullptr)
+		return;
+
+	if (gFinishTimerCommandStreamer == nullptr) gFinishTimerCommandStreamer = that;
+	{
+		auto *b   = static_cast<uint8_t *>(that);
+		void *sc  = *reinterpret_cast<void **>(b + kHWCS5SchedulerOffset);
+		if (gFinishTimerScheduler == nullptr && sc != nullptr) gFinishTimerScheduler = sc;
+	}
+
+	{
+		const uint32_t n = __sync_add_and_fetch(&gRcsCount, 1u) - 1u;
+		void *hwsp = *reinterpret_cast<void **>(
+		    static_cast<uint8_t *>(that) + kHWCS5HwspPtrOffset);
+		if (n < kRcsMaxStreamers) {
+			gRcsStreamers[n].cs   = that;
+			gRcsStreamers[n].hwsp = hwsp;
+		}
+	}
+
+	if (!IS_RAPTOR_LAKE_HX())
+		return;
+
+	if (callback->oIGSchedEnablePeriodic == 0) {
+		return;
+	}
+
+	auto *base  = static_cast<uint8_t *>(that);
+	void *sched = *reinterpret_cast<void **>(base + kHWCS5SchedulerOffset);
+	void *src   = *reinterpret_cast<void **>(base + kHWCS5FinishSourceOffset);
+
+	if (sched == nullptr || src == nullptr) {
+		return;
+	}
+
+	using EnableFn = void (*)(void *, void *);
+	reinterpret_cast<EnableFn>(callback->oIGSchedEnablePeriodic)(sched, src);
+}
+
 // V54: IRQ watchdog — re-enables Master IRQ if the driver disables it during init.
 // Fires every 2s, up to 5 times (10s total), then stops.
-void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
-	static int v54WatchdogCount = 0;
-	v54WatchdogCount++;
+void Gen11::v54IrqWatchdog(thread_call_param_t, thread_call_param_t param1) {
+	auto self = static_cast<thread_call_t>(param1);
+	if (__sync_fetch_and_or(&gIrqWatchdogStop, 0u) != 0) {
+		if (self) thread_call_free(self);
+		return;
+	}
+	__sync_add_and_fetch(&gIrqWatchdogActive, 1u);
+	if (__sync_fetch_and_or(&gIrqWatchdogStop, 0u) != 0 || !NGreen::callback || !NGreen::callback->mmioValid()) {
+		__sync_sub_and_fetch(&gIrqWatchdogActive, 1u);
+		if (self) thread_call_free(self);
+		return;
+	}
+	const int v54WatchdogCount = static_cast<int>(__sync_add_and_fetch(&gIrqWatchdogPasses, 1u));
 	
 	uint32_t mstrIrq = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
 	bool enabled = !!(mstrIrq & GEN11_MASTER_IRQ);
@@ -9357,17 +9631,15 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 		NGreen::callback->readReg32(ERROR_GEN6));
 	
 	// Re-arm for up to 5 iterations
-	if (v54WatchdogCount < 5) {
-		// Allocate a fresh timer call for the next iteration
-		auto nextTimer = thread_call_allocate(v54IrqWatchdog, nullptr);
-		if (nextTimer) {
+	if (v54WatchdogCount < 5 && __sync_fetch_and_or(&gIrqWatchdogStop, 0u) == 0) {
 			uint64_t deadline;
 			clock_interval_to_deadline(2, kSecondScale, &deadline);
-			thread_call_enter_delayed(nextTimer, deadline);
-		}
+		thread_call_enter1_delayed(self, self, deadline);
 	} else {
 		SYSLOG("ngreen", "V54W: watchdog complete after %d iterations", v54WatchdogCount);
+		if (self) thread_call_free(self);
 	}
+	__sync_sub_and_fetch(&gIrqWatchdogActive, 1u);
 }
 // V44: Bundle/property logging helper — logs Metal/GL/VA bundle names after a delay.
 static const char *v44SafeCString(OSString *str) {
@@ -9378,9 +9650,16 @@ static const char *v44SafeCString(OSString *str) {
     return cstr ? cstr : "<null-cstr>";
 }
 
-static void v44DelayedBundleLog(thread_call_param_t p0, thread_call_param_t p1) {
-    auto *svc = static_cast<IOService *>(p0);
-    unsigned delayMs = (unsigned)(uintptr_t)p1;
+static void v44DelayedBundleLog(thread_call_param_t p0, thread_call_param_t) {
+    auto *context = static_cast<DelayedServiceCall *>(p0);
+    auto *svc = context->service;
+    unsigned delayMs = context->delayMs;
+    thread_call_free(context->call);
+    IODelete(context, DelayedServiceCall, 1);
+    if (svc->isInactive()) {
+        svc->release();
+        return;
+    }
 
     auto *metalProp = OSDynamicCast(OSString, svc->getProperty("MetalPluginName"));
     auto *glProp    = OSDynamicCast(OSString, svc->getProperty("IOGLBundleName"));
@@ -9406,18 +9685,21 @@ static void v44DelayedBundleLog(thread_call_param_t p0, thread_call_param_t p1) 
 
 static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs) {
     auto *svc = static_cast<IOService *>(accelInstance);
+    auto *context = svc ? IONewZero(DelayedServiceCall, 1) : nullptr;
+    if (!context)
+        return;
     svc->retain();
 
-    thread_call_t tc = thread_call_allocate(v44DelayedBundleLog,
-                                        static_cast<thread_call_param_t>(svc));
-    if (tc) {
+    context->service = svc;
+    context->delayMs = delayMs;
+    context->call = thread_call_allocate(v44DelayedBundleLog, context);
+    if (context->call) {
         uint64_t deadline;
         clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
-        thread_call_enter1_delayed(tc,
-                                   (thread_call_param_t)(uintptr_t)delayMs,
-                                   deadline);
+        thread_call_enter_delayed(context->call, deadline);
     } else {
         svc->release();
+        IODelete(context, DelayedServiceCall, 1);
     }
 }
 
@@ -9522,366 +9804,29 @@ static uint32_t fwAckReg(unsigned d) {
 
 // Gen12 Media ForceWake: per-engine register pairs (VDBOX + VEBOX)
 struct FwMediaEngine {
+	uint8_t engineBit;
 	uint32_t req;
 	uint32_t ack;
 	const char *name;
 };
 static const FwMediaEngine fwMediaEngines[] = {
-	{ FORCEWAKE_MEDIA_VDBOX_GEN11(0), FORCEWAKE_ACK_MEDIA_VDBOX_GEN11(0), "VDBOX0" },  // 0xa540 / 0x0D50
-	{ FORCEWAKE_MEDIA_VEBOX_GEN11(0), FORCEWAKE_ACK_MEDIA_VEBOX_GEN11(0), "VEBOX0" },  // 0xa560 / 0x0D70
+	{ 3, FORCEWAKE_MEDIA_VDBOX_GEN11(0), FORCEWAKE_ACK_MEDIA_VDBOX_GEN11(0), "VDBOX0" },  // 0xa540 / 0x0D50
+	{ 4, FORCEWAKE_MEDIA_VDBOX_GEN11(2), FORCEWAKE_ACK_MEDIA_VDBOX_GEN11(2), "VDBOX2" },
+	{ 5, FORCEWAKE_MEDIA_VEBOX_GEN11(0), FORCEWAKE_ACK_MEDIA_VEBOX_GEN11(0), "VEBOX0" },  // 0xa560 / 0x0D70
 };
 
 void Gen11::wrapSafeForceWake(void *that, bool set, uint32_t dom) {
 	forceWake(that, set, dom, 1);  // forward to our forceWake with ctx=1 (normal, non-IRQ)
 }
 
-void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
+void Gen11::forceWake(void *that, bool set, uint32_t dom, uint32_t ctx) {
+	if (!that || !callback || !NGreen::callback)
+		return;
+
+	const bool fwLockHeld = ctx == 1;
+
 	// V61: silenced per-call logging — was flooding Lilu circular buffer (384+ entries/boot)
 	// preventing V60M health monitor and delayed child check entries from surviving
-	
-	// ── Hangcheck: dump GPU state once after stamp-timeout restart ──
-	// During init, ~14 forceWake calls happen. After IOAcceleratorFamily2 submits
-	// work and the stamp times out (~5s later), a burst of restart-related calls
-	// occurs. Dump full RCS/BCS state once on the 30th call to capture post-hang state.
-	static int fwCallCount = 0;
-	static bool hangcheckDumped = false;
-	fwCallCount++;
-	
-	if (!hangcheckDumped && fwCallCount == 15) {
-		hangcheckDumped = true;
-		SYSLOG("ngreen", "=== HANGCHECK: GPU state dump (fwCall=%d) ===", fwCallCount);
-		
-		// Acquire both Render + Blitter ForceWake for reliable reads
-		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
-		NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 1);
-		IODelay(1000);
-		
-		SYSLOG("ngreen", "HANGCHECK ForceWake ACK: Render=0x%x Blitter=0x%x",
-			NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9),
-			NGreen::callback->readReg32(FORCEWAKE_ACK_BLITTER_GEN9));
-		
-		// RCS ring state
-		SYSLOG("ngreen", "HANGCHECK RCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
-			NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_START(RENDER_RING_BASE)));
-		SYSLOG("ngreen", "HANGCHECK RCS ACTHD=0x%x:%08x IPEHR=0x%x",
-			NGreen::callback->readReg32(RING_ACTHD_UDW(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_ACTHD(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_IPEHR(RENDER_RING_BASE)));
-		SYSLOG("ngreen", "HANGCHECK RCS INSTDONE=0x%x DMA_FADD=0x%x:%08x",
-			NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_DMA_FADD_UDW(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_DMA_FADD(RENDER_RING_BASE)));
-		SYSLOG("ngreen", "HANGCHECK RCS EIR=0x%x ESR=0x%x EMR=0x%x",
-			NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
-			NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
-		// V203: EXECLIST_STATUS is a 64-bit context descriptor echo.
-		// LRCA GGTT byte address = full64 & ~0xFFF  (bits[11:0] are context flags).
-		// Must combine both words — the upper 12 bits of the GGTT address live in elsHi bits[11:0].
-		// RING_MODE bit15 = GFX_RUN_LIST_ENABLE; if 0, ExecList submissions are silently dropped.
-		{
-			uint32_t rcsMode = NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE));
-			SYSLOG("ngreen", "HANGCHECK V205: RING_MODE=0x%x GFX_RUN_LIST_ENABLE=%d",
-				rcsMode, !!(rcsMode & (1u << 15)));
-			uint32_t elsLo = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
-			uint32_t elsHi = NGreen::callback->readReg32(RENDER_RING_BASE + 0x238);
-			uint32_t hws   = NGreen::callback->readReg32(RING_HWS_PGA(RENDER_RING_BASE));
-			// Correct LRCA extraction: descriptor is 64-bit, LRCA = full64 & ~0xFFF.
-			// Using only elsLo gives the wrong address (e.g. 0x18000 instead of 0x40018000).
-			uint64_t fullDesc = ((uint64_t)elsHi << 32) | elsLo;
-			uint32_t lrcaGgtt = (uint32_t)(fullDesc & ~0xFFFULL);
-			SYSLOG("ngreen", "HANGCHECK RCS EXECLIST_STATUS=0x%08x:%08x lrca_ggtt=0x%x HWS_PGA=0x%x",
-				elsHi, elsLo, lrcaGgtt, hws);
-			// V204: Context Status Buffer — each entry records what happened to submitted contexts.
-			// Entry status bits[2:0]: 1=idle, 2=active, 4=preempted, 8=element-switch, 0x10=complete.
-			// wr_ptr advances after each event; rd_ptr is the software "consumed up to here" pointer.
-			{
-				uint32_t csp = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
-				uint32_t wrPtr = (csp >> 8) & 0x7;
-				uint32_t rdPtr = csp & 0x7;
-				SYSLOG("ngreen", "HANGCHECK V204: CSB CTX_STATUS_PTR=0x%x wr=%d rd=%d",
-					csp, wrPtr, rdPtr);
-				for (int i = 0; i < 6; i++) {
-					uint32_t csbHi = NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF_HI(RENDER_RING_BASE, i));
-					uint32_t csbLo = NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF(RENDER_RING_BASE, i));
-					SYSLOG("ngreen", "HANGCHECK V204: CSB[%d]=%08x:%08x ctx_id=%d status=0x%x%s",
-						i, csbHi, csbLo,
-						(csbLo >> 8) & 0xFF,
-						csbLo & 0xFF,
-						(csbLo & 0x10) ? " COMPLETE" :
-						(csbLo & 0x08) ? " ELEMENT_SWITCH" :
-						(csbLo & 0x04) ? " PREEMPTED" :
-						(csbLo & 0x02) ? " ACTIVE" :
-						(csbLo & 0x01) ? " IDLE" : " (empty/unknown)");
-				}
-			}
-			// V204: Read PTE for the HWS page — if HWS isn't mapped, CS completion writes fault.
-			// Also read PTE for the legacy RING_START page (the preamble ring buffer).
-			if (hws) {
-				uint32_t hwsPg  = hws >> 12;
-				uint32_t hwsPLo = NGreen::callback->readReg32(GGTT_PTE_LO(hwsPg));
-				uint32_t hwsPHi = NGreen::callback->readReg32(GGTT_PTE_HI(hwsPg));
-				SYSLOG("ngreen", "HANGCHECK V204: HWS PTE[page 0x%x]=%08x:%08x present=%d llc=%d",
-					hwsPg, hwsPHi, hwsPLo, hwsPLo & 1, (hwsPLo >> 3) & 1);
-			} else {
-				SYSLOG("ngreen", "HANGCHECK V204: HWS_PGA=0 (status page NOT set up!)");
-			}
-			{
-				uint32_t rStart = NGreen::callback->readReg32(RING_START(RENDER_RING_BASE));
-				uint32_t rHead  = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
-				if (rStart) {
-					uint32_t rPg  = rStart >> 12;
-					uint32_t rPLo = NGreen::callback->readReg32(GGTT_PTE_LO(rPg));
-					uint32_t rPHi = NGreen::callback->readReg32(GGTT_PTE_HI(rPg));
-					SYSLOG("ngreen", "HANGCHECK V204: RING_START PTE[page 0x%x]=%08x:%08x present=%d llc=%d",
-						rPg, rPHi, rPLo, rPLo & 1, (rPLo >> 3) & 1);
-					// Dump the preamble ring: HEAD bytes already executed — these are the
-					// exact commands Apple submitted. IPEHR=last command pipelined.
-					NGreen::callback->setApertureIfNecessary();
-					if (NGreen::callback->aperturePtr && NGreen::callback->apertureLen >= 0x2000 && (rPLo & 1)) {
-						volatile uint32_t *ap = NGreen::callback->aperturePtr;
-						uint32_t saveLo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
-						uint32_t saveHi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
-						NGreen::callback->writeReg32(GGTT_PTE_LO(0), rPLo);
-						NGreen::callback->writeReg32(GGTT_PTE_HI(0), rPHi);
-						NGreen::callback->writeReg32(0x101008, 0x1);
-						uint32_t dumpDW = (rHead + 0x3F) / 4;  // round HEAD up to nearest 16 DW
-						if (dumpDW < 16) dumpDW = 16;
-						if (dumpDW > 64) dumpDW = 64;
-						SYSLOG("ngreen", "HANGCHECK V204: preamble ring [0..0x%x] (HEAD=0x%x IPEHR=0x%x):",
-							dumpDW*4 - 1, rHead,
-							NGreen::callback->readReg32(RING_IPEHR(RENDER_RING_BASE)));
-						for (uint32_t i = 0; i < dumpDW; i += 4)
-							SYSLOG("ngreen", "HANGCHECK V204: ring[%02d-%02d] +0x%02x: %08x %08x %08x %08x",
-								i, i+3, i*4, ap[i], ap[i+1], ap[i+2], ap[i+3]);
-						NGreen::callback->writeReg32(GGTT_PTE_LO(0), saveLo);
-						NGreen::callback->writeReg32(GGTT_PTE_HI(0), saveHi);
-						NGreen::callback->writeReg32(0x101008, 0x1);
-					}
-				}
-			}
-			// V205: Dump LRCA via aperture remap — no IOMappedRead32, no PTE range issue.
-			// Temporarily point GGTT page 0 at each LRCA page, read via aperturePtr[0],
-			// then restore. GPU is hung so clobbering GGTT[0] momentarily is safe.
-			if (lrcaGgtt) {
-				uint32_t lPg0 = lrcaGgtt >> 12;
-				uint32_t lPg1 = lPg0 + 1;
-				uint32_t p0Lo = NGreen::callback->readReg32(GGTT_PTE_LO(lPg0));
-				uint32_t p0Hi = NGreen::callback->readReg32(GGTT_PTE_HI(lPg0));
-				uint32_t p1Lo = NGreen::callback->readReg32(GGTT_PTE_LO(lPg1));
-				uint32_t p1Hi = NGreen::callback->readReg32(GGTT_PTE_HI(lPg1));
-				SYSLOG("ngreen", "HANGCHECK V205: LRCA ggtt=0x%x pg0 PTE=%08x:%08x present=%d | pg1 PTE=%08x:%08x present=%d",
-					lrcaGgtt, p0Hi, p0Lo, p0Lo & 1, p1Hi, p1Lo, p1Lo & 1);
-				NGreen::callback->setApertureIfNecessary();
-				if (NGreen::callback->aperturePtr && NGreen::callback->apertureLen >= 0x2000 &&
-				    (p0Lo & 1) && (p1Lo & 1))
-				{
-					volatile uint32_t *ap = NGreen::callback->aperturePtr;
-					uint32_t saveLo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
-					uint32_t saveHi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
-					// Remap GGTT[0] → LRCA page0 (PPHWSP)
-					NGreen::callback->writeReg32(GGTT_PTE_LO(0), p0Lo);
-					NGreen::callback->writeReg32(GGTT_PTE_HI(0), p0Hi);
-					NGreen::callback->writeReg32(0x101008, 0x1);
-					SYSLOG("ngreen", "HANGCHECK V205: LRCA page0 (PPHWSP) DW0..31:");
-					for (int i = 0; i < 8; i++)
-						SYSLOG("ngreen", "HANGCHECK V205: LRCA[%02d-%02d] %08x %08x %08x %08x",
-							i*4, i*4+3, ap[i*4], ap[i*4+1], ap[i*4+2], ap[i*4+3]);
-					// Remap GGTT[0] → LRCA page1 (ctx-reg-image)
-					NGreen::callback->writeReg32(GGTT_PTE_LO(0), p1Lo);
-					NGreen::callback->writeReg32(GGTT_PTE_HI(0), p1Hi);
-					NGreen::callback->writeReg32(0x101008, 0x1);
-					SYSLOG("ngreen", "HANGCHECK V205: LRCA page1 (ctx-reg-image) DW0..63:");
-					for (int i = 0; i < 16; i++)
-						SYSLOG("ngreen", "HANGCHECK V205: LRCA+1K[%02d-%02d] %08x %08x %08x %08x",
-							i*4, i*4+3, ap[i*4], ap[i*4+1], ap[i*4+2], ap[i*4+3]);
-					// Restore GGTT[0]
-					NGreen::callback->writeReg32(GGTT_PTE_LO(0), saveLo);
-					NGreen::callback->writeReg32(GGTT_PTE_HI(0), saveHi);
-					NGreen::callback->writeReg32(0x101008, 0x1);
-				} else {
-					SYSLOG("ngreen", "HANGCHECK V205: remap skipped aper=%s len=0x%llx p0=%d p1=%d",
-						NGreen::callback->aperturePtr ? "ok" : "null",
-						(unsigned long long)NGreen::callback->apertureLen,
-						p0Lo & 1, p1Lo & 1);
-				}
-			}
-		}
-
-		// V206: Dump preamble stamp target pages (GPU addr 0x40000000 / 0x40001200).
-		// PC1 writes 0 → GGTT[0x40000]+0, PC2 writes stamp value 2 → GGTT[0x40001]+0x200.
-		// If either PTE is invalid the PIPE_CONTROL write silently drops and
-		// fwWaitForHardwareRegisterValue polls forever.
-		{
-			NGreen::callback->setApertureIfNecessary();
-			auto *apcb = NGreen::callback;
-			if (apcb->aperturePtr && apcb->apertureLen >= 0x1000) {
-				volatile uint32_t *ap = apcb->aperturePtr;
-				uint32_t saveLo = apcb->readReg32(GGTT_PTE_LO(0));
-				uint32_t saveHi = apcb->readReg32(GGTT_PTE_HI(0));
-
-				// PC1 clear target: GGTT[0x40000]
-				uint32_t pc1Lo = apcb->readReg32(GGTT_PTE_LO(0x40000));
-				uint32_t pc1Hi = apcb->readReg32(GGTT_PTE_HI(0x40000));
-				SYSLOG("ngreen", "HANGCHECK V206: stamp PC1 GGTT[0x40000] PTE=%08x:%08x present=%d llc=%d",
-					pc1Hi, pc1Lo, pc1Lo & 1, (pc1Lo >> 3) & 1);
-				if (pc1Lo & 1) {
-					asm volatile("wbinvd" ::: "memory");
-					apcb->writeReg32(GGTT_PTE_LO(0), pc1Lo);
-					apcb->writeReg32(GGTT_PTE_HI(0), pc1Hi);
-					apcb->writeReg32(0x101008, 0x1);
-					SYSLOG("ngreen", "HANGCHECK V206: GGTT[0x40000] DW[0..3]=%08x %08x %08x %08x",
-						ap[0], ap[1], ap[2], ap[3]);
-				}
-
-				// PC2 stamp target: GGTT[0x40001] + 0x200 = DW[0x80]
-				uint32_t pc2Lo = apcb->readReg32(GGTT_PTE_LO(0x40001));
-				uint32_t pc2Hi = apcb->readReg32(GGTT_PTE_HI(0x40001));
-				SYSLOG("ngreen", "HANGCHECK V206: stamp PC2 GGTT[0x40001] PTE=%08x:%08x present=%d llc=%d",
-					pc2Hi, pc2Lo, pc2Lo & 1, (pc2Lo >> 3) & 1);
-				if (pc2Lo & 1) {
-					asm volatile("wbinvd" ::: "memory");
-					apcb->writeReg32(GGTT_PTE_LO(0), pc2Lo);
-					apcb->writeReg32(GGTT_PTE_HI(0), pc2Hi);
-					apcb->writeReg32(0x101008, 0x1);
-					// DW[0x80] = offset 0x200 = the stamp value written by PC2
-					SYSLOG("ngreen", "HANGCHECK V206: GGTT[0x40001] DW[0x7e..0x81]=%08x %08x %08x %08x (stamp@DW[0x80]=%08x)",
-						ap[0x7e], ap[0x7f], ap[0x80], ap[0x81], ap[0x80]);
-				}
-
-				apcb->writeReg32(GGTT_PTE_LO(0), saveLo);
-				apcb->writeReg32(GGTT_PTE_HI(0), saveHi);
-				apcb->writeReg32(0x101008, 0x1);
-			} else {
-				SYSLOG("ngreen", "HANGCHECK V206: aperture unavailable — skipping stamp target dump");
-			}
-		}
-
-		// BCS ring state (with proper Blitter ForceWake held!)
-		SYSLOG("ngreen", "HANGCHECK BCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
-			NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_START(BLT_RING_BASE)));
-		SYSLOG("ngreen", "HANGCHECK BCS HWS_PGA=0x%x ACTHD=0x%x:%08x",
-			NGreen::callback->readReg32(RING_HWS_PGA(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_ACTHD_UDW(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_ACTHD(BLT_RING_BASE)));
-		SYSLOG("ngreen", "HANGCHECK BCS IPEHR=0x%x INSTDONE=0x%x",
-			NGreen::callback->readReg32(RING_IPEHR(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_INSTDONE(BLT_RING_BASE)));
-		SYSLOG("ngreen", "HANGCHECK BCS EIR=0x%x ESR=0x%x EMR=0x%x",
-			NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_ESR(BLT_RING_BASE)),
-			NGreen::callback->readReg32(RING_EMR(BLT_RING_BASE)));
-		
-		// Global error state
-		SYSLOG("ngreen", "HANGCHECK ERROR_GEN6=0x%x RING_FAULT=0x%x",
-			NGreen::callback->readReg32(0x40A0),
-			NGreen::callback->readReg32(0xCEC4));
-		SYSLOG("ngreen", "HANGCHECK FAULT_TLB0=0x%x TLB1=0x%x",
-			NGreen::callback->readReg32(0x4B10),
-			NGreen::callback->readReg32(0x4B14));
-		SYSLOG("ngreen", "HANGCHECK GT_INTR_DW0=0x%x DW1=0x%x",
-			NGreen::callback->readReg32(0x190018),
-			NGreen::callback->readReg32(0x19001C));
-		
-		// V47: RING_TIMESTAMP — check if GPU engines have processed any commands
-		// Timestamp increments with GPU clock whenever the engine is active.
-		// If it's 0 or unchanged from start, the engine never executed anything.
-		SYSLOG("ngreen", "HANGCHECK V47: RCS RING_TIMESTAMP=0x%x BCS RING_TIMESTAMP=0x%x",
-			NGreen::callback->readReg32(RENDER_RING_BASE + 0x358),
-			NGreen::callback->readReg32(BLT_RING_BASE + 0x358));
-		
-		// V47: Re-check GFX_MSTR_IRQ — did someone disable master interrupt since start?
-		uint32_t hcMstr = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
-		SYSLOG("ngreen", "HANGCHECK V47: GFX_MSTR_IRQ=0x%x (bit31=%d)", hcMstr, !!(hcMstr & GEN11_MASTER_IRQ));
-		if (!(hcMstr & GEN11_MASTER_IRQ)) {
-			SYSLOG("ngreen", "HANGCHECK V47: Master IRQ disabled! Re-enabling...");
-			NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ);
-		}
-
-		// V202: GGTT PTE verification — ForceWake is held so reads are reliable.
-		// GGTT[0] (stolen memory base) MUST have a valid PTE — if it shows 0 here
-		// then either stolen memory was never mapped (fatal) or the base address is wrong.
-		// PLANE_SURF PTE reveals whether the display engine can actually DMA the surface.
-		{
-			uint32_t pte0Lo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
-			uint32_t pte0Hi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
-			SYSLOG("ngreen", "HANGCHECK V202: GGTT[0] (stolen base) PTE=%08x:%08x present=%d llc=%d",
-				pte0Hi, pte0Lo, pte0Lo & 1, (pte0Lo >> 3) & 1);
-
-			// Display registers don't need GT ForceWake — read live PLANE_SURF.
-			uint32_t hcSurf = NGreen::callback->readReg32(0x7019C);
-			if (hcSurf) {
-				uint32_t surfPg  = hcSurf >> 12;
-				uint32_t surfPLo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPg));
-				uint32_t surfPHi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPg));
-				SYSLOG("ngreen", "HANGCHECK V202: PLANE_SURF=0x%x (page 0x%x) PTE=%08x:%08x present=%d llc=%d",
-					hcSurf, surfPg, surfPHi, surfPLo, surfPLo & 1, (surfPLo >> 3) & 1);
-			} else {
-				SYSLOG("ngreen", "HANGCHECK V202: PLANE_SURF=0 (display armed to null)");
-			}
-		}
-
-		// Release ForceWake
-		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
-		NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
-		
-		// V42: Enumerate accelerator children at hangcheck time
-		if (callback->accelInstance) {
-			auto *service = static_cast<IOService *>(callback->accelInstance);
-			OSIterator *iter = service->getClientIterator();
-			int childCount = 0;
-			if (iter) {
-				OSObject *obj;
-				while ((obj = iter->getNextObject())) {
-					auto *child = OSDynamicCast(IOService, obj);
-					if (child) {
-						SYSLOG("ngreen", "HANGCHECK child[%d]: %s (busy=%d)", childCount,
-							child->getName(), child->getBusyState());
-						// Check if child has its own children (user clients)
-						OSIterator *iter2 = child->getClientIterator();
-						if (iter2) {
-							int ucCount = 0;
-							OSObject *obj2;
-							while ((obj2 = iter2->getNextObject())) {
-								auto *uc = OSDynamicCast(IOService, obj2);
-								if (uc) {
-									SYSLOG("ngreen", "HANGCHECK   child[%d].uc[%d]: %s", childCount, ucCount, uc->getName());
-									ucCount++;
-								}
-							}
-							iter2->release();
-						}
-						childCount++;
-					}
-				}
-				iter->release();
-			}
-			SYSLOG("ngreen", "HANGCHECK accelerator has %d children total", childCount);
-			
-			// V45: Log IOService state at hangcheck time
-			uint64_t hcState = service->getState();
-			bool hcOpen = service->isOpen();
-			SYSLOG("ngreen", "HANGCHECK V45: state=0x%llx (reg=%d match=%d pub=%d fmatch=%d inact=%d) isOpen=%d",
-				   (unsigned long long)hcState,
-				   !!(hcState & 0x02), !!(hcState & 0x04), !!(hcState & 0x08),
-				   !!(hcState & 0x10), !!(hcState & 0x01), hcOpen);
-		}
-		
-		// V42: Check interrupt state — did GT_INTR_DW0 re-assert since we cleared it?
-		SYSLOG("ngreen", "HANGCHECK IRQ: RENDER_COPY_INTR_EN=0x%x RCS0_RSVD_MASK=0x%x",
-			NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE),
-			NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK));
-		SYSLOG("ngreen", "HANGCHECK IRQ: GFX_MSTR_IRQ=0x%x",
-			NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ));
-		
-		SYSLOG("ngreen", "=== HANGCHECK: dump complete ===");
-	}
 	
 	// ctx 2: IRQ, ctx 1: normal
 	uint32_t ack_exp = set << ctx;
@@ -9892,29 +9837,57 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 		if (!(dom & d)) continue;
 
 		if (d == DOM_MEDIA) {
-			// Gen12+: Media uses per-engine ForceWake (VDBOX + VEBOX), NOT Gen9 single register
+			const uint32_t mediaAckExp = set ? 1u : 0u;
+			const uint32_t mediaMask = 1u;
+			const uint32_t mediaWrite = 0x10000u | mediaAckExp;
+			const auto *accelerator = reinterpret_cast<const volatile uint8_t *>(that);
+			const uint64_t activeEngineMask =
+				*reinterpret_cast<const volatile uint64_t *>(accelerator + 0x1300);
 			for (const auto &eng : fwMediaEngines) {
-				wrapWriteRegister32(callback->framecont, eng.req, wr);
+				if ((activeEngineMask & (1ULL << eng.engineBit)) == 0)
+					continue;
+				wrapWriteRegister32(callback->framecont, eng.req, mediaWrite);
 				IOPause(100);
-				if (!pollRegister(eng.ack, ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS) &&
-					!forceWakeWaitAckFallback(eng.req, eng.ack, ack_exp, mask) &&
-					!pollRegister(eng.ack, ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
-					SYSLOG("ngreen", "ForceWake timeout for %s (dom=0x%x), expected 0x%x", eng.name, dom, ack_exp);
-				else
+				const bool mediaAcked = fwLockHeld
+					? pollRegisterFast(eng.ack, mediaAckExp, mediaMask, kFwAckLockedUs)
+					: (pollRegister(eng.ack, mediaAckExp, mediaMask, FORCEWAKE_ACK_TIMEOUT_MS) ||
+					   forceWakeWaitAckFallback(eng.req, eng.ack, mediaAckExp, mediaMask) ||
+					   pollRegister(eng.ack, mediaAckExp, mediaMask, FORCEWAKE_ACK_TIMEOUT_MS));
+				if (mediaAcked)
 					DBGLOG("ngreen", "ForceWake OK %s set=%d", eng.name, set);
 			}
 		} else {
+			if (d == DOM_BLITTER && set) {
+				const uint32_t writeVal = (1u | 0x10000u) << ctx;
+				wrapWriteRegister32(callback->framecont, fwReqReg(d), writeVal);
+				IODelay(500);
+				continue;
+			}
 			wrapWriteRegister32(callback->framecont, fwReqReg(d), wr);
 			IOPause(100);
-			if (!pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS) &&
-				!forceWakeWaitAckFallback(fwReqReg(d), fwAckReg(d), ack_exp, mask) &&
-				!pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
+			const bool domAcked = fwLockHeld
+				? pollRegisterFast(fwAckReg(d), ack_exp, mask, kFwAckLockedUs)
+				: (pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS) ||
+				   forceWakeWaitAckFallback(fwReqReg(d), fwAckReg(d), ack_exp, mask) ||
+				   pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS));
+			if (!domAcked)
 				SYSLOG("ngreen", "ForceWake timeout for domain %s (dom=0x%x), expected 0x%x", strForDom(d), dom, ack_exp);
 			else
 				DBGLOG("ngreen", "ForceWake OK domain=%s set=%d ack=0x%x", strForDom(d), set, wrapReadRegister32(callback->framecont, fwAckReg(d)));
 		}
 	}
 	// V61: silenced — see above
+}
+
+bool Gen11::pollRegisterFast(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeoutUs) {
+    uint64_t now = 0, deadline = 0;
+    clock_interval_to_deadline(timeoutUs, kMicrosecondScale, &deadline);
+    for (clock_get_uptime(&now); now < deadline; clock_get_uptime(&now)) {
+        auto rd = wrapReadRegister32(callback->framecont, reg);
+        if ((rd & mask) == val)
+            return true;
+    }
+    return false;
 }
 
 bool Gen11::pollRegister(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeout) {

@@ -1370,6 +1370,11 @@ private:
 	
 	// ── Accelerator start & forcewake ──
 	static unsigned long start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
+
+	static void wrapHWCS5RegisterForInterrupts(void *that);
+	mach_vm_address_t oHWCS5RegisterForInterrupts {};
+	mach_vm_address_t oIGSchedEnablePeriodic {};
+
 	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
 	static void v60GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V60: active ERROR_GEN6 suppression + monitor
 	static void v71EmrEnforcer(thread_call_param_t, thread_call_param_t);  // V71: high-freq EMR mask + ERROR clear (50ms)
@@ -1392,11 +1397,15 @@ private:
 	mach_vm_address_t osubmitBlit {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check
-	static void forceWake(void *that, bool set, uint32_t dom, uint8_t ctx);  // custom forcewake
+	static void forceWake(void *that, bool set, uint32_t dom, uint32_t ctx);  // custom forcewake
 	mach_vm_address_t oforceWake {};
 	static void wrapSafeForceWake(void *that, bool set, uint32_t dom);       // SafeForceWake wrapper
 	mach_vm_address_t oSafeForceWake {};
+
+	static void wrapSafeForceWakeReent(void *that, bool wake, uint32_t domain);
+	mach_vm_address_t oSafeForceWakeReent {};
 	static bool pollRegister(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeout);
+	static bool pollRegisterFast(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeoutUs);
 	static bool forceWakeWaitAckFallback(uint32_t reqReg, uint32_t ackReg, uint32_t val, uint32_t mask);
 	
 	static void * serviceInterrupts(void *param_1);  // GT interrupt handler
@@ -1459,6 +1468,8 @@ private:
 	// PAVP = Protected Audio Video Path (DRM session management)
 	static IOReturn wrapPavpSessionCallback(void *intelAccelerator, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4, bool flag);
 	mach_vm_address_t orgPavpSessionCallback {};
+	static IOReturn wrapPavpCommandCallbackObj(void *intelAccelerator, OSObject *owner, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4);
+	mach_vm_address_t orgPavpCommandCallbackObj {};
 	
 	// CSR = DMC firmware patch data pointers (stepping-specific)
 	const uint8_t *_CSR_PATCH_B0plus;  // B0+ stepping
@@ -1864,6 +1875,9 @@ private:
 	static uint64_t IGHardwareContextinitWithOptions(void *that, void *task, const void *params, uint8_t arg);
 	mach_vm_address_t oIGHardwareContextinitWithOptions {};
 
+	static void wrapContextFree(void *that);
+	mach_vm_address_t oContextFree {};
+
 	// Extended GPU context init — sets up additional context state (PPGTT, aux tables)
 	static uint64_t IGHardwareExtendedContextinitWithOptions
 			  (void *that,void *param_1,
@@ -1988,7 +2002,7 @@ private:
 
 	static void applyPreStartEngineWorkarounds(int callCount); // only error/EMR clear — safe before ring init
 	static void applyPreStopEngineWorkarounds(int callCount);  // full GT WAs + BCS drain — before stop only
-	static unsigned long stopGraphicsEngine(void *that);    // V505: dump ring preamble before ring is stopped
+	static bool stopGraphicsEngine(void *that);    // V505: dump ring preamble before ring is stopped
 	mach_vm_address_t ostopGraphicsEngine {};
 
 	static unsigned long startGraphicsEngine(void *that);  // V163: clear PERCTX_PREEMPT_CTRL before first context snapshot
