@@ -74,6 +74,24 @@ static volatile UInt32 gIrqWatchdogPasses = 0;
 static volatile UInt32 gEmrEnforcerArmed = 0;
 static int gEmrCount = 0;
 
+static inline bool isKernelPointer(uint64_t p) {
+	return p >= 0xffffff8000000000ull && p < 0xffffffff00000000ull;
+}
+
+static constexpr uint64_t kScratchSizeOriginal = 0xd240;
+static constexpr uint64_t kScratchSizeRounded = 0xe000;
+
+static void roundScratchSize(void *params) {
+	auto *sz = reinterpret_cast<volatile uint64_t *>(static_cast<uint8_t *>(params) + 0x10);
+	const uint64_t was = *sz;
+	if (was == kScratchSizeOriginal) {
+		if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS) {
+			*sz = kScratchSizeRounded;
+			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+		}
+	}
+}
+
 static constexpr uint32_t kRenderWaMcrSelector   = 0xfdc;
 static constexpr uint32_t kRenderWaMcrMulticast  = 1u << 31;
 static constexpr uint32_t kRenderWaMcrSliceMask  = 0xfu << 27;
@@ -111,6 +129,21 @@ static void applyRenderWa(NGreen *cb, bool steer) {
 		cb->writeReg32(GEN10_SAMPLER_MODE, (ENABLE_SMALLPL << 16) | ENABLE_SMALLPL);
 		if (!mcOn) cb->writeReg32(kRenderWaMcrSelector, selNow);
 	}
+}
+
+static constexpr uint64_t kScratchSizeApple = 0xd240;
+
+static void copyScratchUngated(void *mappedBuf, mach_vm_address_t origScratchInit, mach_vm_address_t origGetMemory) {
+	if (!isKernelPointer(reinterpret_cast<uint64_t>(mappedBuf))) return;
+	const uint64_t size = getMember<uint64_t>(mappedBuf, 0x20);
+	const uint64_t hold = getMember<uint64_t>(mappedBuf, 0x30);
+	const uint64_t memH = isKernelPointer(hold) ? getMember<uint64_t>(reinterpret_cast<void *>(hold), 0x18) : 0;
+	uint64_t mem = 0;
+	if (origGetMemory != 0) mem = reinterpret_cast<uint64_t>(reinterpret_cast<void *(*)(void *)>(origGetMemory)(mappedBuf));
+	if (!isKernelPointer(mem) && isKernelPointer(memH)) mem = memH;
+	if (size < kScratchSizeApple || size > 0x20000 || (size & 0xfffu) != 0) return;
+	if (!isKernelPointer(mem) || origScratchInit == 0) return;
+	reinterpret_cast<void (*)(void *)>(origScratchInit)(reinterpret_cast<void *>(mem));
 }
 
 static constexpr size_t   kCtxLrcBufOff   = 0x98;
@@ -223,6 +256,30 @@ static void applyContextWa(NGreen *cb, void *ctx) {
 	const uint64_t size = buf ? getMember<uint64_t>(buf, 0x20) : 0;
 	if (img == nullptr || size < LRC_STATE_OFFSET + 0x1000u || size > 0x100000u) return;
 	patchImageWa(img, static_cast<uint32_t>((size - LRC_STATE_OFFSET) / 4u));
+}
+
+static constexpr uint32_t kDsbSizePatchAt = 10;
+static const uint8_t kDsbSizePre[] = {0x49, 0x8d, 0x44, 0x0c, 0xff, 0x31, 0xd2, 0x48, 0xf7, 0xf1,
+                                   0x25, 0xff, 0xff, 0x0f, 0x00, 0x49, 0x09, 0xf3};
+
+static void patchDsbSize(mach_vm_address_t address, size_t size) {
+	uint8_t post[sizeof(kDsbSizePre)];
+	memcpy(post, kDsbSizePre, sizeof(post));
+	post[kDsbSizePatchAt] = 0xb8;
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	uint32_t n = 0, nPost = 0;
+	size_t at = 0;
+	for (size_t i = 0; i + sizeof(kDsbSizePre) <= size; i++) {
+		if (img[i] != 0x49) continue;
+		if (memcmp(img + i, kDsbSizePre, sizeof(kDsbSizePre)) == 0) { if (n++ == 0) at = i; }
+		else if (memcmp(img + i, post, sizeof(post)) == 0) { if (nPost++ == 0) at = i; }
+	}
+	if (n + nPost == 0) return;
+	if (n + nPost > 1) return;
+	if (nPost == 1) return;
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	*const_cast<uint8_t *>(img + at + kDsbSizePatchAt) = 0xb8;
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
 }
 
 static IOSimpleLock *gCtxFreeLock = nullptr;
@@ -340,6 +397,195 @@ static void patchEdpTranscoder(mach_vm_address_t address, size_t size) {
 static thread_call_t     gScanoutLateCall   = nullptr;
 static volatile uint32_t gScanoutLateFires  = 0;
 static volatile uint32_t gImrFixDone    = 0;
+
+static mach_vm_address_t gBlit2DSupported = 0;
+static mach_vm_address_t gBlit3DSupported = 0;
+
+static void *blit3dInitBefore(void *ctx) {
+	auto *cb = Gen11::callback;
+	auto *pool = ctx ? getMember<uint8_t *>(ctx, 0xe0) : nullptr;
+	auto *ch = pool ? getMember<uint8_t *>(pool, 0x20) : nullptr;
+	if (cb == nullptr || cb->oIOAF2_submitBuffer == 0 || ch == nullptr) return nullptr;
+	using IncrementStamp = void (*)(void *);
+	const auto vt = *reinterpret_cast<uintptr_t *>(ch);
+	reinterpret_cast<IncrementStamp>(*reinterpret_cast<uintptr_t *>(vt + 0x148))(ch);
+	return pool;
+}
+static void blit3dInitAfter(void *pool) {
+	if (pool == nullptr) return;
+	using SubmitBuffer = void (*)(void *);
+	reinterpret_cast<SubmitBuffer>(Gen11::callback->oIOAF2_submitBuffer)(pool);
+}
+
+static volatile uint32_t gBarrierArmed = 1u;
+
+static bool barrierWants() {
+	return gBarrierArmed != 0;
+}
+static void barrierHangSeen() {
+	gBarrierArmed = 0;
+}
+
+static const uint32_t kClearColorSrgb8[255] = {
+	0x391f22b4, 0x39eeb40e, 0x3a46eb61, 0x3a8b3e5e, 0x3ab3070b, 0x3adacfb8, 0x3b014c33, 0x3b153089,
+	0x3b2914df, 0x3b3cf936, 0x3b50f2d1, 0x3b65fb9b, 0x3b7c3403, 0x3b89d060, 0x3b962333, 0x3ba314bd,
+	0x3bb0a731, 0x3bbedcb7, 0x3bcdb76d, 0x3bdd3967, 0x3bed64af, 0x3bfe3b46, 0x3c07df91, 0x3c10f91b,
+	0x3c1a6b32, 0x3c2436c8, 0x3c2e5cc7, 0x3c38de1a, 0x3c43bba4, 0x3c4ef648, 0x3c5a8ee4, 0x3c668654,
+	0x3c72dd71, 0x3c7f950f, 0x3c865702, 0x3c8d148f, 0x3c940396, 0x3c9b247c, 0x3ca277a6, 0x3ca9fd78,
+	0x3cb1b653, 0x3cb9a298, 0x3cc1c2a9, 0x3cca16e3, 0x3cd29fa4, 0x3cdb5d4b, 0x3ce45032, 0x3ced78b5,
+	0x3cf6d72e, 0x3d0035fc, 0x3d051bb4, 0x3d0a1cec, 0x3d0f39d0, 0x3d14728a, 0x3d19c745, 0x3d1f382c,
+	0x3d24c567, 0x3d2a6f22, 0x3d303584, 0x3d3618b7, 0x3d3c18e4, 0x3d423632, 0x3d4870ca, 0x3d4ec8d2,
+	0x3d553e73, 0x3d5bd1d3, 0x3d628318, 0x3d69526a, 0x3d703fee, 0x3d774bca, 0x3d7e7624, 0x3d82df90,
+	0x3d869372, 0x3d8a56cb, 0x3d8e29ab, 0x3d920c27, 0x3d95fe4f, 0x3d9a0035, 0x3d9e11ec, 0x3da23384,
+	0x3da66510, 0x3daaa6a0, 0x3daef847, 0x3db35a15, 0x3db7cc1b, 0x3dbc4e6b, 0x3dc0e114, 0x3dc58429,
+	0x3dca37b9, 0x3dcefbd6, 0x3dd3d08f, 0x3dd8b5f5, 0x3dddac19, 0x3de2b30a, 0x3de7cad9, 0x3decf395,
+	0x3df22d50, 0x3df77817, 0x3dfcd3fc, 0x3e012087, 0x3e03dfae, 0x3e06a77b, 0x3e0977f6, 0x3e0c5126,
+	0x3e0f3314, 0x3e121dc5, 0x3e151143, 0x3e180d95, 0x3e1b12c2, 0x3e1e20d1, 0x3e2137cb, 0x3e2457b6,
+	0x3e278099, 0x3e2ab27d, 0x3e2ded68, 0x3e313161, 0x3e347e70, 0x3e37d49c, 0x3e3b33ec, 0x3e3e9c67,
+	0x3e420e15, 0x3e4588fb, 0x3e490d22, 0x3e4c9a90, 0x3e50314c, 0x3e53d15d, 0x3e577aca, 0x3e5b2d9a,
+	0x3e5ee9d4, 0x3e62af7e, 0x3e667e9f, 0x3e6a573e, 0x3e6e3962, 0x3e722511, 0x3e761a52, 0x3e7a192c,
+	0x3e7e21a5, 0x3e8119e2, 0x3e8327c7, 0x3e853a86, 0x3e875222, 0x3e896e9d, 0x3e8b8ffc, 0x3e8db641,
+	0x3e8fe170, 0x3e92118b, 0x3e944696, 0x3e968095, 0x3e98bf89, 0x3e9b0377, 0x3e9d4c62, 0x3e9f9a4c,
+	0x3ea1ed38, 0x3ea4452b, 0x3ea6a226, 0x3ea9042e, 0x3eab6b44, 0x3eadd76d, 0x3eb048aa, 0x3eb2bf00,
+	0x3eb53a71, 0x3eb7bb00, 0x3eba40b1, 0x3ebccb85, 0x3ebf5b81, 0x3ec1f0a7, 0x3ec48af9, 0x3ec72a7c,
+	0x3ec9cf32, 0x3ecc791e, 0x3ecf2842, 0x3ed1dca2, 0x3ed49641, 0x3ed75521, 0x3eda1946, 0x3edce2b2,
+	0x3edfb168, 0x3ee2856a, 0x3ee55ebd, 0x3ee83d63, 0x3eeb215d, 0x3eee0ab1, 0x3ef0f95f, 0x3ef3ed6b,
+	0x3ef6e6d8, 0x3ef9e5a8, 0x3efce9de, 0x3efff37e, 0x3f018145, 0x3f030b82, 0x3f049877, 0x3f062827,
+	0x3f07ba92, 0x3f094fb9, 0x3f0ae79f, 0x3f0c8244, 0x3f0e1faa, 0x3f0fbfd2, 0x3f1162be, 0x3f13086e,
+	0x3f14b0e4, 0x3f165c22, 0x3f180a29, 0x3f19bafa, 0x3f1b6e96, 0x3f1d24ff, 0x3f1ede36, 0x3f209a3c,
+	0x3f225913, 0x3f241abc, 0x3f25df38, 0x3f27a689, 0x3f2970af, 0x3f2b3dad, 0x3f2d0d83, 0x3f2ee032,
+	0x3f30b5bd, 0x3f328e24, 0x3f346968, 0x3f36478b, 0x3f38288f, 0x3f3a0c73, 0x3f3bf33a, 0x3f3ddce5,
+	0x3f3fc975, 0x3f41b8eb, 0x3f43ab48, 0x3f45a08f, 0x3f4798bf, 0x3f4993db, 0x3f4b91e3, 0x3f4d92d8,
+	0x3f4f96bd, 0x3f519d92, 0x3f53a758, 0x3f55b411, 0x3f57c3be, 0x3f59d65f, 0x3f5bebf7, 0x3f5e0486,
+	0x3f60200e, 0x3f623e90, 0x3f64600c, 0x3f668485, 0x3f68abfb, 0x3f6ad670, 0x3f6d03e5, 0x3f6f345a,
+	0x3f7167d2, 0x3f739e4d, 0x3f75d7cc, 0x3f781451, 0x3f7a53dd, 0x3f7c9671, 0x3f7edc0e,
+};
+static uint32_t clearColorUnorm(uint32_t b, uint32_t n) {
+	const uint64_t mx = (1ull << n) - 1ull;
+	if (b >> 31) return 0;
+	const uint32_t e = (b >> 23) & 0xffu, m = b & 0x7fffffu;
+	if (e == 0xffu) return m != 0 ? 0u : static_cast<uint32_t>(mx);
+	if (e >= 127u) return static_cast<uint32_t>(mx);
+	if (e == 0) return 0;
+	const uint32_t sh = 150u - e;
+	if (sh > 63u) return 0;
+	return static_cast<uint32_t>((static_cast<uint64_t>(m | 0x800000u) * mx + (1ull << (sh - 1u))) >> sh);
+}
+static uint32_t clearColorSnorm(uint32_t b, uint32_t n) {
+	const uint32_t mag = clearColorUnorm(b & 0x7fffffffu, n - 1u);
+	return ((b >> 31) ? (0u - mag) : mag) & ((1u << n) - 1u);
+}
+static uint32_t clearColorHalf(uint32_t b) {
+	const uint32_t s = (b >> 16) & 0x8000u, m = b & 0x7fffffu;
+	const int e = static_cast<int>((b >> 23) & 0xffu);
+	if (e == 0xff) return s | 0x7c00u | (m != 0 ? 0x200u : 0u);
+	const int ee = e - 112;
+	if (ee >= 31) return s | 0x7c00u;
+	if (ee <= 0) {
+		if (ee < -10) return s;
+		const uint32_t mm = m | 0x800000u, sh = static_cast<uint32_t>(14 - ee);
+		uint32_t h = mm >> sh;
+		const uint32_t rem = mm & ((1u << sh) - 1u), half = 1u << (sh - 1u);
+		if (rem > half || (rem == half && (h & 1u))) h++;
+		return s | h;
+	}
+	uint32_t h = (static_cast<uint32_t>(ee) << 10) | (m >> 13);
+	const uint32_t rem = m & 0x1fffu;
+	if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+	return s | h;
+}
+static uint32_t clearColorSrgb8(uint32_t b) {
+	if ((b >> 31) || b == 0) return 0;
+	if (((b >> 23) & 0xffu) == 0xffu && (b & 0x7fffffu) != 0) return 0;
+	uint32_t lo = 0, hi = 255;
+	while (lo < hi) {
+		const uint32_t mid = (lo + hi) / 2u;
+		if (kClearColorSrgb8[mid] <= b) lo = mid + 1u; else hi = mid;
+	}
+	return lo;
+}
+static uint32_t clearColorUfloat(uint32_t b, uint32_t mb) {
+	const int e = static_cast<int>((b >> 23) & 0xffu) - 127;
+	const uint32_t m = b & 0x7fffffu, top = 0x1fu << mb;
+	if (e == 128) return m != 0 ? (top | 1u) : ((b >> 31) ? 0u : top);
+	if ((b >> 31) || e <= -15) return 0;
+	if (e > 15) return top - 1u;
+	const uint32_t sh = 23u - mb, v = (static_cast<uint32_t>(e + 15) << mb) + ((m + (1u << (sh - 1u))) >> sh);
+	return v >= top ? top - 1u : v;
+}
+static bool clearColorPack(uint32_t fmt, const uint32_t c[4], uint32_t px[2]) {
+	const uint32_t r = c[0], g = c[1], b = c[2], a = c[3];
+	px[0] = px[1] = 0;
+	switch (fmt) {
+	case 0x140: px[0] = clearColorUnorm(r, 8); return true;
+	case 0x144: px[0] = clearColorUnorm(a, 8); return true;
+	case 0x106: px[0] = clearColorUnorm(r, 8) | clearColorUnorm(g, 8) << 8; return true;
+	case 0x0c7: case 0x0eb:
+		px[0] = clearColorUnorm(r, 8) | clearColorUnorm(g, 8) << 8 | clearColorUnorm(b, 8) << 16 | clearColorUnorm(a, 8) << 24; return true;
+	case 0x0c8: case 0x0ec:
+		px[0] = clearColorSrgb8(r) | clearColorSrgb8(g) << 8 | clearColorSrgb8(b) << 16 | clearColorUnorm(a, 8) << 24; return true;
+	case 0x0c0: case 0x0e9:
+		px[0] = clearColorUnorm(b, 8) | clearColorUnorm(g, 8) << 8 | clearColorUnorm(r, 8) << 16 | clearColorUnorm(a, 8) << 24; return true;
+	case 0x0c1: case 0x0ea:
+		px[0] = clearColorSrgb8(b) | clearColorSrgb8(g) << 8 | clearColorSrgb8(r) << 16 | clearColorUnorm(a, 8) << 24; return true;
+	case 0x0c2: px[0] = clearColorUnorm(r, 10) | clearColorUnorm(g, 10) << 10 | clearColorUnorm(b, 10) << 20 | clearColorUnorm(a, 2) << 30; return true;
+	case 0x0d1: px[0] = clearColorUnorm(b, 10) | clearColorUnorm(g, 10) << 10 | clearColorUnorm(r, 10) << 20 | clearColorUnorm(a, 2) << 30; return true;
+	case 0x10a: px[0] = clearColorUnorm(r, 16); return true;
+	case 0x0cc: px[0] = clearColorUnorm(r, 16) | clearColorUnorm(g, 16) << 16; return true;
+	case 0x080: px[0] = clearColorUnorm(r, 16) | clearColorUnorm(g, 16) << 16; px[1] = clearColorUnorm(b, 16) | clearColorUnorm(a, 16) << 16; return true;
+	case 0x10e: px[0] = clearColorHalf(r); return true;
+	case 0x0d0: px[0] = clearColorHalf(r) | clearColorHalf(g) << 16; return true;
+	case 0x084: px[0] = clearColorHalf(r) | clearColorHalf(g) << 16; px[1] = clearColorHalf(b) | clearColorHalf(a) << 16; return true;
+	case 0x0d3: px[0] = clearColorUfloat(r, 6) | clearColorUfloat(g, 6) << 11 | clearColorUfloat(b, 5) << 22; return true;
+	case 0x141: px[0] = clearColorSnorm(r, 8); return true;
+	case 0x107: px[0] = clearColorSnorm(r, 8) | clearColorSnorm(g, 8) << 8; return true;
+	case 0x0c9: px[0] = clearColorSnorm(r, 8) | clearColorSnorm(g, 8) << 8 | clearColorSnorm(b, 8) << 16 | clearColorSnorm(a, 8) << 24; return true;
+	case 0x10b: px[0] = clearColorSnorm(r, 16); return true;
+	case 0x0cd: px[0] = clearColorSnorm(r, 16) | clearColorSnorm(g, 16) << 16; return true;
+	case 0x081: px[0] = clearColorSnorm(r, 16) | clearColorSnorm(g, 16) << 16; px[1] = clearColorSnorm(b, 16) | clearColorSnorm(a, 16) << 16; return true;
+	case 0x142: case 0x143: px[0] = r & 0xffu; return true;
+	case 0x108: case 0x109: px[0] = (r & 0xffu) | (g & 0xffu) << 8; return true;
+	case 0x0ca: case 0x0cb: px[0] = (r & 0xffu) | (g & 0xffu) << 8 | (b & 0xffu) << 16 | (a & 0xffu) << 24; return true;
+	case 0x10c: case 0x10d: px[0] = r & 0xffffu; return true;
+	case 0x0ce: case 0x0cf: px[0] = (r & 0xffffu) | (g & 0xffffu) << 16; return true;
+	case 0x082: case 0x083: px[0] = (r & 0xffffu) | (g & 0xffffu) << 16; px[1] = (b & 0xffffu) | (a & 0xffffu) << 16; return true;
+	case 0x0c4: px[0] = (r & 0x3ffu) | (g & 0x3ffu) << 10 | (b & 0x3ffu) << 20 | (a & 3u) << 30; return true;
+	default: return false;
+	}
+}
+static inline uint32_t clearColorR32(const void *p, uint32_t off) {
+	return *reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(p) + off);
+}
+static void fillClearColor(const void *cmd, const void *desc, const void *heaps) {
+	const uint32_t count = *reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(cmd) + 0xe);
+	if (clearColorR32(cmd, 0x4) > 0x118u || count == 0 || count > 8u) return;
+	volatile uint32_t *batch = *reinterpret_cast<volatile uint32_t *const *>(static_cast<const uint8_t *>(desc) + 0x20);
+	const uint8_t *ssh = *reinterpret_cast<const uint8_t *const *>(static_cast<const uint8_t *>(heaps) + 0x58);
+	if (batch == nullptr || ssh == nullptr) return;
+	bool any = false;
+	for (uint32_t i = 0; i < count && !any; i++) any = clearColorR32(cmd, 0x18u + i * 0x20u + 0x14u) != 0;
+	if (!any) return;
+	volatile uint32_t *s = batch + clearColorR32(cmd, 0x8);
+	const uint32_t hdr = s[0];
+	if (hdr != 0x10200407u) return;
+	if (s[7] != 0 || s[8] != 0) return;
+	const uint64_t addr = (static_cast<uint64_t>(s[2] & 0xffffu) << 32) | (s[1] & ~3u);
+	if (addr == 0) return;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint32_t eo = 0x18u + i * 0x20u;
+		if (clearColorR32(cmd, eo + 0x14u) == 0) continue;
+		const uint32_t *rss = reinterpret_cast<const uint32_t *>(ssh + clearColorR32(cmd, eo + 0xcu));
+		if ((rss[6] & 7u) != 5u || (rss[10] & 0x400u) == 0) continue;
+		if (((static_cast<uint64_t>(rss[13] & 0xffffu) << 32) | (rss[12] & ~0x3fu)) != addr) continue;
+		const uint32_t fmt = (rss[0] >> 18) & 0x1ffu;
+		const uint32_t raw[4] = {s[3], s[4], s[5], s[6]};
+		uint32_t px[2];
+		if (!clearColorPack(fmt, raw, px)) return;
+		s[7] = px[0];
+		s[8] = px[1];
+		return;
+	}
+}
 
 static constexpr uint32_t kDpTpEnhancedFrame = 0x40000u;
 static constexpr uint32_t kDpTpCtlA      = 0x60540u;
@@ -1752,6 +1998,33 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		const bool forceFullMTL = shouldForceFullMetalPath();
 
 		{
+			SolveRequestPlus resolvePoolParams[] = {
+				{"__ZN24IGHardwareResolveContext17ExtendedCtxParamsE", this->ResolveExtendedCtxParams},
+			};
+			if (!SolveRequestPlus::solveAll(patcher, index, resolvePoolParams, address, size)) {
+				patcher.clearError();
+			}
+		}
+		{
+			SolveRequestPlus blitSyms[] = {
+				{"__Z16blit2d_supportedPK15blit3d_params_tRK8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyEP9_WA_TABLE",
+				 gBlit2DSupported},
+				{"__Z16blit3d_supportedPK15blit3d_params_tRK8IGVectorI11rect_pair_t25IGIOMallocAllocatorPolicyE",
+				 gBlit3DSupported},
+			};
+			if (!SolveRequestPlus::solveAll(patcher, index, blitSyms, address, size)) {
+				patcher.clearError();
+			}
+		}
+
+		{
+			auto pb = patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base");
+			if (pb == 0) patcher.clearError();
+			auto pm = patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max");
+			if (pm == 0) patcher.clearError();
+		}
+
+		{
 			SolveRequestPlus enableSolve[] = {
 				{"__ZN11IGScheduler33enablePeriodicEventTimerInterruptEP22IOInterruptEventSource",
 				 this->oIGSchedEnablePeriodic},
@@ -1899,6 +2172,20 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			else
 				patcher.clearError();
 		}
+		{
+			RouteRequestPlus renderExecuteRoute[] = {
+				{"__ZN23IntelMTLRenderFunctions7executeEN14IntelMTLRender7eTokensER19IGAccelCommandQueueR26IGAccelSegmentResourceListRK20IOAccelKernelCommandR24IGAccelCommandDescriptorR13IGHeapsAccessR22IOGraphicsAccelerator2R17IGHardwareContextR12IOAccelEvent",
+				 wrapRenderExecute, this->oRenderExecute},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, renderExecuteRoute, address, size)) patcher.clearError();
+		}
+		{
+			RouteRequestPlus hangRoute[] = {
+				{"__ZN20IGHardwareRingBuffer14doHangAnalysisEv", wrapDoHangAnalysis, this->oDoHangAnalysis},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, hangRoute, address, size)) patcher.clearError();
+		}
+		patchDsbSize(address, size);
 
 		{
 			RouteRequestPlus startRoute[] = {
@@ -2115,43 +2402,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t r_v139_movaps_40[] = {
 			0x41, 0x0f, 0x11, 0x59, 0x40
 		};
-		static const uint8_t f_v141_movapd_00[] = {
-			0x66, 0x41, 0x0f, 0x29, 0x09
-		};
-		static const uint8_t r_v141_movapd_00[] = {
-			0x66, 0x41, 0x0f, 0x11, 0x09
-		};
 
-		// V140: Cover the switch cases that use contextual aligned stores at [r9] / [r9+20].
-		// These are the remaining sites after V139's generic signatures.
-		static const uint8_t f_v140_default_store00[] = {
-			0x0f, 0x28, 0xcb, 0x66, 0x0f, 0x15, 0xcc, 0x41, 0x0f, 0x29, 0x09,
-			0x0f, 0x28, 0xcb, 0x0f, 0xc6, 0xcc, 0xcc
-		};
-		static const uint8_t r_v140_default_store00[] = {
-			0x0f, 0x28, 0xcb, 0x66, 0x0f, 0x15, 0xcc, 0x41, 0x0f, 0x11, 0x09,
-			0x0f, 0x28, 0xcb, 0x0f, 0xc6, 0xcc, 0xcc
-		};
-		static const uint8_t f_v140_default_store20[] = {
-			0x0f, 0xc6, 0xcc, 0xcc, 0x41, 0x0f, 0x29, 0x49, 0x20, 0x0f, 0x16, 0xdc
-		};
-		static const uint8_t r_v140_default_store20[] = {
-			0x0f, 0xc6, 0xcc, 0xcc, 0x41, 0x0f, 0x11, 0x49, 0x20, 0x0f, 0x16, 0xdc
-		};
-		static const uint8_t f_v140_case4_store00[] = {
-			0x0f, 0x28, 0xcc, 0xf2, 0x0f, 0x12, 0xcb, 0x66, 0x41, 0x0f, 0x29, 0x09,
-			0x0f, 0x28, 0xcb, 0x0f, 0xc6, 0xcc, 0xc6
-		};
-		static const uint8_t r_v140_case4_store00[] = {
-			0x0f, 0x28, 0xcc, 0xf2, 0x0f, 0x12, 0xcb, 0x66, 0x41, 0x0f, 0x11, 0x09,
-			0x0f, 0x28, 0xcb, 0x0f, 0xc6, 0xcc, 0xc6
-		};
-		static const uint8_t f_v140_case4_store20[] = {
-			0x0f, 0xc6, 0xcc, 0xc6, 0x41, 0x0f, 0x29, 0x49, 0x20, 0x0f, 0xc6, 0xdc, 0x4e
-		};
-		static const uint8_t r_v140_case4_store20[] = {
-			0x0f, 0xc6, 0xcc, 0xc6, 0x41, 0x0f, 0x11, 0x49, 0x20, 0x0f, 0xc6, 0xdc, 0x4e
-		};
 		[&]() __attribute__((noinline)) {
 
 		{
@@ -2219,78 +2470,14 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					f_v139_movaps_00,
 					r_v139_movaps_00,
 					arrsize(f_v139_movaps_00),
-					1
-				};
-				LookupPatchPlus const patchV139Store00Skip1 {
-					activeKext,
-					f_v139_movaps_00,
-					r_v139_movaps_00,
-					arrsize(f_v139_movaps_00),
-					1,
-					1
-				};
-				LookupPatchPlus const patchV139Store00Skip2 {
-					activeKext,
-					f_v139_movaps_00,
-					r_v139_movaps_00,
-					arrsize(f_v139_movaps_00),
-					1,
-					2
-				};
-				LookupPatchPlus const patchV139Store00Skip3 {
-					activeKext,
-					f_v139_movaps_00,
-					r_v139_movaps_00,
-					arrsize(f_v139_movaps_00),
-					1,
-					3
-				};
-				LookupPatchPlus const patchV139Store00Skip4 {
-					activeKext,
-					f_v139_movaps_00,
-					r_v139_movaps_00,
-					arrsize(f_v139_movaps_00),
-					1,
-					4
-				};
-				LookupPatchPlus const patchV139Store00Skip5 {
-					activeKext,
-					f_v139_movaps_00,
-					r_v139_movaps_00,
-					arrsize(f_v139_movaps_00),
-					1,
-					5
+					6
 				};
 				LookupPatchPlus const patchV139Store20 {
 					activeKext,
 					f_v139_movaps_20,
 					r_v139_movaps_20,
 					arrsize(f_v139_movaps_20),
-					1
-				};
-				LookupPatchPlus const patchV139Store20Skip1 {
-					activeKext,
-					f_v139_movaps_20,
-					r_v139_movaps_20,
-					arrsize(f_v139_movaps_20),
-					1,
-					1
-				};
-				LookupPatchPlus const patchV139Store20Skip2 {
-					activeKext,
-					f_v139_movaps_20,
-					r_v139_movaps_20,
-					arrsize(f_v139_movaps_20),
-					1,
-					2
-				};
-				LookupPatchPlus const patchV139Store20Skip3 {
-					activeKext,
-					f_v139_movaps_20,
-					r_v139_movaps_20,
-					arrsize(f_v139_movaps_20),
-					1,
-					3
+					4
 				};
 				LookupPatchPlus const patchV139Store40 {
 					activeKext,
@@ -2299,66 +2486,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					arrsize(f_v139_movaps_40),
 					1
 				};
-				LookupPatchPlus const patchV141StoreMovapd00 {
-					activeKext,
-					f_v141_movapd_00,
-					r_v141_movapd_00,
-					arrsize(f_v141_movapd_00),
-					1
-				};
-				LookupPatchPlus const patchV140DefaultStore00 {
-					activeKext,
-					f_v140_default_store00,
-					r_v140_default_store00,
-					arrsize(f_v140_default_store00),
-					1
-				};
-				LookupPatchPlus const patchV140DefaultStore20 {
-					activeKext,
-					f_v140_default_store20,
-					r_v140_default_store20,
-					arrsize(f_v140_default_store20),
-					1
-				};
-				LookupPatchPlus const patchV140Case4Store00 {
-					activeKext,
-					f_v140_case4_store00,
-					r_v140_case4_store00,
-					arrsize(f_v140_case4_store00),
-					1
-				};
-				LookupPatchPlus const patchV140Case4Store20 {
-					activeKext,
-					f_v140_case4_store20,
-					r_v140_case4_store20,
-					arrsize(f_v140_case4_store20),
-					1
-				};
-				int v139Applied = 0;
-				v139Applied += patchV139Store10.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store30.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store50.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store00.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store00Skip1.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store00Skip2.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store00Skip3.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store00Skip4.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store00Skip5.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store20.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store20Skip1.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store20Skip2.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store20Skip3.apply(patcher, address, size) ? 1 : 0;
-				v139Applied += patchV139Store40.apply(patcher, address, size) ? 1 : 0;
-				SYSLOG("ngreen", "V139: blit3d unaligned-store mitigation applied %d/12 signatures", v139Applied);
-				int v141Applied = 0;
-				v141Applied += patchV141StoreMovapd00.apply(patcher, address, size) ? 1 : 0;
-				SYSLOG("ngreen", "V141: blit3d movapd mitigation applied %d/1 signatures", v141Applied);
-				int v140Applied = 0;
-				v140Applied += patchV140DefaultStore00.apply(patcher, address, size) ? 1 : 0;
-				v140Applied += patchV140DefaultStore20.apply(patcher, address, size) ? 1 : 0;
-				v140Applied += patchV140Case4Store00.apply(patcher, address, size) ? 1 : 0;
-				v140Applied += patchV140Case4Store20.apply(patcher, address, size) ? 1 : 0;
-				SYSLOG("ngreen", "V140: contextual blit3d store mitigation applied %d/4 signatures", v140Applied);
+				if (!patchV139Store10.apply(patcher, address, size)) patcher.clearError();
+				if (!patchV139Store30.apply(patcher, address, size)) patcher.clearError();
+				if (!patchV139Store50.apply(patcher, address, size)) patcher.clearError();
+				if (!patchV139Store00.apply(patcher, address, size)) patcher.clearError();
+				if (!patchV139Store20.apply(patcher, address, size)) patcher.clearError();
+				if (!patchV139Store40.apply(patcher, address, size)) patcher.clearError();
 
 				SYSLOG("ngreen", "V52: Applied RPL-specific patches (topology hardcode + BCS bypass)");
 			} else {
@@ -6254,6 +6387,15 @@ void Gen11::getGPUInfo(void *that)
 
 }
 
+long Gen11::wrapRenderExecute(uint32_t token, void *queue, void *resList, const void *cmd, void *desc, void *heaps,
+                              void *accel, void *hwCtx, void *event)
+{
+	const long r = FunctionCast(wrapRenderExecute, callback->oRenderExecute)(token, queue, resList, cmd, desc, heaps,
+	                                                                           accel, hwCtx, event);
+	if (token == 0x10004u && r == 0 && cmd != nullptr && desc != nullptr && heaps != nullptr) fillClearColor(cmd, desc, heaps);
+	return r;
+}
+
 void Gen11::wrapContextFree(void *that)
 {
 	auto *cb = NGreen::callback;
@@ -6616,7 +6758,10 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 uint64_t Gen11::blit3d_init_ctx(void *that)
 {
 	// V128 rollback: allow original Blit3D context init on spoofed paths.
-	return FunctionCast(blit3d_init_ctx, callback->oblit3d_init_ctx)(that);
+	void *pool = blit3dInitBefore(that);
+	const uint64_t rc = FunctionCast(blit3d_init_ctx, callback->oblit3d_init_ctx)(that);
+	blit3dInitAfter(pool);
+	return rc;
 }
 
 void Gen11::blit3d_initialize_scratch_space(void *that)
@@ -6778,7 +6923,11 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		return;
 	}
 
+	copyScratchUngated(mappedBufPtr, callback->oblit3d_initialize_scratch_space, callback->oIGMappedBuffergetMemory);
+
+	void *pool = blit3dInitBefore(that);
 	uint64_t rc = FunctionCast(blit3d_init_ctx, callback->oblit3d_init_ctx)(that);
+	blit3dInitAfter(pool);
 	if (v69Verbose)
 		SYSLOG("ngreen", "V148: blit3d_init_ctx returned %llu, ctx+0xb8=0x%llx ctx+0xd8=%p ctx+0xe0=%p",
 			   (unsigned long long)rc,
@@ -7220,6 +7369,8 @@ uint64_t Gen11::IGHardwareExtendedContextinitWithOptions(void *that,void *param_
 		SYSLOG("ngreen", "V502: initWithOptions ExtCtxParams=%p +0x10=0x%llx +0x18=0x%llx (0=simple,!=0=GPU-cmd)",
 			   param_2, (unsigned long long)p2f10, (unsigned long long)p2f18);
 	}
+	if (param_2 != nullptr && callback->Blit3DExtendedCtxParams != 0 && reinterpret_cast<mach_vm_address_t>(param_2) == callback->Blit3DExtendedCtxParams)
+		roundScratchSize(param_2);
 	uint64_t ret = FunctionCast(IGHardwareExtendedContextinitWithOptions, callback->oIGHardwareExtendedContextinitWithOptions)(that,param_1,param_2);
 	void *b8post = getMember<void *>(that, 0xb8);
 	// V115 REMOVED: V115 suppressed initWithOptions to prevent MCE from GGTT[0]→stolen mem.
@@ -7409,6 +7560,39 @@ void  Gen11::initBlitUsage(void *that)
 }
 
 unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
+	if (!NGreen::callback->isRealTGL && param_1) {
+		auto *blit = reinterpret_cast<uint8_t *>(param_1);
+		const uint32_t route = (blit[0xA2] >> 3U) & 0x3U;
+		void *taskVt = param_3 ? getMember<void *>(param_3, 0x0) : nullptr;
+		const bool hasTask = param_3 && taskVt && callback->osubmitBlit;
+		if (route == 3) {
+			if (hasTask)
+				return FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4);
+		} else if (route == 0 && hasTask) {
+			bool pass = ((blit[0x3C] & 1U) != 0) || ((blit[0x84] & 1U) != 0) ||
+			            (*reinterpret_cast<uint64_t *>(blit + 0x20) != 0) ||
+			            (*reinterpret_cast<uint64_t *>(blit + 0x68) != 0);
+			bool steer = false;
+			if (!pass && gBlit2DSupported)
+				pass = !reinterpret_cast<bool (*)(void *, void *, void *)>(gBlit2DSupported)(
+					param_1, param_2, reinterpret_cast<uint8_t *>(that) + 0xF2E);
+			if (!pass && gBlit3DSupported)
+				pass = steer = reinterpret_cast<bool (*)(void *, void *)>(gBlit3DSupported)(param_1, param_2);
+			if (pass) {
+				const uint64_t dst = *reinterpret_cast<uint64_t *>(blit + 0x48) + *reinterpret_cast<uint32_t *>(blit + 0x74);
+				const uint64_t src = *reinterpret_cast<uint64_t *>(blit + 0x00) + *reinterpret_cast<uint32_t *>(blit + 0x2C);
+				if (dst == 0 || src == 0)
+					return 1;
+				const uint8_t saved = blit[0xA2];
+				if (steer) blit[0xA2] = static_cast<uint8_t>(saved | 0x18U);
+				const unsigned long ret =
+					FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4);
+				blit[0xA2] = saved;
+				return ret;
+			}
+		}
+	}
+
 	// V186: For spoofed non-TGL, if V142 is configured to bypass submitBlit,
 	// return before any task/context touching logic. The V149/V171 path writes
 	// task+0x298 and can poison task lifetime on some boots, later crashing in
@@ -7699,6 +7883,15 @@ uint32_t Gen11::beginCoalescedSegment(void *that) {
 uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 								 void *event, uint16_t count, const uint16_t *list) {
 	if (!NGreen::callback->isRealTGL) {
+		if (barrierWants()) {
+			void *task = cmdDesc ? getMember<void *>(cmdDesc, 0x8) : nullptr;
+			auto ready = [](void *c) { return c != nullptr && getMember<void *>(c, 0xb8) != nullptr; };
+			if (callback->obarrierSubmission != 0 && task != nullptr && ready(getBlit2DContext(task, true)) &&
+			    ready(getBlit3DContext(task, true)) && ready(getDepthResolveContext(task, true)) &&
+			    ready(getColorResolveContext(task, true)))
+				return FunctionCast(barrierSubmission, callback->obarrierSubmission)(queue, accelerator, cmdDesc,
+				                                                                      event, count, list);
+		}
 		// V130: spoof-path guard for deterministic barrierSubmission+0x198 crash.
 		// Boot-arg control (value or flags):
 		//   ngreenV130=0 or -ngreenV130fail -> bypass and return 0 (default)
@@ -7921,6 +8114,13 @@ void * Gen11::getColorResolveContext(void *that,bool param_1)
 		}
 	}
 	return ctx;
+}
+
+uint32_t Gen11::wrapDoHangAnalysis(void *that)
+{
+	barrierHangSeen();
+	using Fn = uint32_t (*)(void *);
+	return reinterpret_cast<Fn>(callback->oDoHangAnalysis)(that);
 }
 
 int Gen11::blit3d_supported()

@@ -542,6 +542,13 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			SYSLOG("ngreen", "V500: set_id_mode hook FAILED — symbol not found");
 		}
 
+		if (Gen11::callback) {
+			SolveRequestPlus blit3dInitSolve[] = {
+				{"__ZN25IOAccelCommandBufferPool212submitBufferEv", Gen11::callback->oIOAF2_submitBuffer},
+			};
+			if (!SolveRequestPlus::solveAll(patcher, index, blit3dInitSolve, address, size))
+				patcher.clearError();
+		}
 	}  else if (kextAppleGraphicsDeviceControl.loadIndex == index) {
 		static const uint8_t wrangler_wait_f[]  = {0xc4, 0x48, 0x89, 0xc7, 0x48, 0xc7, 0xc6, 0xff, 0xff, 0xff, 0xff, 0xe8};
 		static const uint8_t wrangler_wait_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};

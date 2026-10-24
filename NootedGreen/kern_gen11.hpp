@@ -1878,6 +1878,10 @@ private:
 	static void wrapContextFree(void *that);
 	mach_vm_address_t oContextFree {};
 
+	static long wrapRenderExecute(uint32_t token, void *queue, void *resList, const void *cmd, void *desc, void *heaps,
+	                              void *accel, void *hwCtx, void *event);
+	mach_vm_address_t oRenderExecute {};
+
 	// Extended GPU context init — sets up additional context state (PPGTT, aux tables)
 	static uint64_t IGHardwareExtendedContextinitWithOptions
 			  (void *that,void *param_1,
@@ -2064,6 +2068,10 @@ public:
 	// Resolved from IOAcceleratorFamily2 by NGreen::processKext — needed by blit3d scratch init.
 	mach_vm_address_t oIOAF2_lockForCPUAccess {};
 	mach_vm_address_t oIOAF2_unlockForCPUAccess {};
+	mach_vm_address_t oIOAF2_submitBuffer {};
+	mach_vm_address_t ResolveExtendedCtxParams {};
+	static uint32_t wrapDoHangAnalysis(void *that);
+	mach_vm_address_t oDoHangAnalysis {};
 
 	void init();  // register kextInfos with Lilu
 	static Gen11 *callback;  // singleton for Lilu static callbacks
