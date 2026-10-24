@@ -261,6 +261,44 @@ static void vdscDisable(void *path) {
 	vdscClearDss();
 }
 
+static constexpr mach_vm_address_t kAgdcNubDoAttributeOff = 0xe6db4;
+static const uint8_t kAgdcNubPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48};
+static constexpr uint32_t kAgdcNubRegisterCallback = 0x923;
+enum : uint32_t { kAgdcNubOff = 0, kAgdcNubWaiting = 1, kAgdcNubDone = 2 };
+static volatile uint32_t gAgdcNubState = kAgdcNubOff;
+static volatile bool gAgdcNubRouted = false;
+static void *gAgdcNubController = nullptr;
+static mach_vm_address_t gAgdcNubOrgCreate = 0, gAgdcNubOrgDoAttribute = 0;
+static uint32_t agdcCallbackStub(void *ctx, uint64_t arg, uint32_t flags, uint32_t code);
+
+static IOReturn wrapAgdcDoAttribute(void *nub, uint32_t cmd, unsigned long *in, unsigned long inSize, unsigned long *out,
+                                unsigned long *outSize, void *args) {
+	if (cmd == kAgdcNubRegisterCallback) return kIOReturnUnsupported;
+	return FunctionCast(wrapAgdcDoAttribute, gAgdcNubOrgDoAttribute)(nub, cmd, in, inSize, out, outSize, args);
+}
+
+static bool agdcWranglerMatched(void *, void *, IOService *, IONotifier *) {
+	if (__sync_bool_compare_and_swap(&gAgdcNubState, kAgdcNubWaiting, kAgdcNubDone))
+		reinterpret_cast<uint64_t (*)(void *)>(gAgdcNubOrgCreate)(gAgdcNubController);
+	return true;
+}
+
+static void armAgdcNub(void *controller, mach_vm_address_t org) {
+	if (!__sync_bool_compare_and_swap(&gAgdcNubState, kAgdcNubOff, kAgdcNubWaiting)) return;
+	gAgdcNubController = controller;
+	gAgdcNubOrgCreate = org;
+	if (controller == nullptr || org == 0 || !gAgdcNubRouted) {
+		gAgdcNubState = kAgdcNubDone;
+		return;
+	}
+	OSDictionary *match = IOService::serviceMatching("AppleGPUWrangler");
+	IONotifier *notifier = match != nullptr
+	    ? IOService::addMatchingNotification(gIOMatchedNotification, match, agdcWranglerMatched, nullptr, nullptr, 0)
+	    : nullptr;
+	OSSafeReleaseNULL(match);
+	if (notifier == nullptr) __sync_bool_compare_and_swap(&gAgdcNubState, kAgdcNubWaiting, kAgdcNubDone);
+}
+
 static constexpr uint32_t kSinkD3HoldMs = 20;
 static constexpr uint32_t kPpsCycleMs  = 500u;
 static constexpr uint32_t kPpsSettleMs = 50u;
@@ -341,6 +379,34 @@ static bool routeTGLDebugOffsets(KernelPatcher &patcher, RouteRequestPlus (&requ
 			*requests[i].org = original;
 	}
 	return true;
+}
+
+static void routeAgdcDoAttribute(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
+	if (kAgdcNubDoAttributeOff + sizeof(kAgdcNubPrologue) > size || memcmp(reinterpret_cast<const void *>(address + kAgdcNubDoAttributeOff), kAgdcNubPrologue, sizeof(kAgdcNubPrologue)) != 0) return;
+	RouteRequestPlus requests[] = {
+		{"__ZN20IntelFBClientControl11doAttributeEjPmmS0_S0_P25IOExternalMethodArguments", wrapAgdcDoAttribute, gAgdcNubOrgDoAttribute},
+	};
+	static constexpr mach_vm_address_t offsets[] = {kAgdcNubDoAttributeOff};
+	gAgdcNubRouted = routeTGLDebugOffsets(patcher, requests, offsets, address, size);
+}
+
+static constexpr mach_vm_address_t kReadDpbResidencyOff = 0xbc8d4;
+static const uint8_t kDpbPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x10, 0x41, 0x89, 0xf6};
+static mach_vm_address_t gOrgReadDpbResidency = 0;
+
+static uint64_t wrapReadDpbResidency(void *tcon, uint32_t type) {
+	if (tcon == nullptr) return 0;
+	return FunctionCast(wrapReadDpbResidency, gOrgReadDpbResidency)(tcon, type);
+}
+
+static void routeDpbResidency(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
+	if (!gAgdcNubRouted) return;
+	if (kReadDpbResidencyOff + sizeof(kDpbPrologue) > size || memcmp(reinterpret_cast<const void *>(address + kReadDpbResidencyOff), kDpbPrologue, sizeof(kDpbPrologue)) != 0) return;
+	RouteRequestPlus requests[] = {
+		{"__ZN12CamelliaBase16ReadDpbResidencyE10kDpbType_t", wrapReadDpbResidency, gOrgReadDpbResidency},
+	};
+	static constexpr mach_vm_address_t offsets[] = {kReadDpbResidencyOff};
+	routeTGLDebugOffsets(patcher, requests, offsets, address, size);
 }
 
 void Gen11::routeAUXTransactionGuard(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
@@ -996,6 +1062,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{"__ZN31AppleIntelFramebufferController28setCDClockFrequencyOnHotplugEv",setCDClockFrequencyOnHotplug, this->osetCDClockFrequencyOnHotplug},
 				{"__ZN31AppleIntelFramebufferController14disableCDClockEv",disableCDClock,this->odisableCDClock},
 				{"__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE",hwRegsNeedUpdate, this->ohwRegsNeedUpdate},
+				{"__ZN31AppleIntelFramebufferController35createAppleGraphicsDeviceControlnubEv", tglCreateAppleGraphicsDeviceControlnub, this->otglCreateAppleGraphicsDeviceControlnub},
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route p symbols");
 			
@@ -1018,6 +1085,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				// V201 diagnostic: read scanout buffer right after hwSetupMemory returns to
 				// detect what fills it (zeros vs wallpaper pixels). FB-only scope.
 				{"__ZN24AppleIntelBaseController13hwSetupMemoryEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsb", wrapHwSetupMemory, this->ohwSetupMemory},
+				{"__ZN24AppleIntelBaseController35createAppleGraphicsDeviceControlnubEv", tglCreateAppleGraphicsDeviceControlnub, this->otglCreateAppleGraphicsDeviceControlnub},
 				{"__ZN24AppleIntelBaseController10metricsLogE14kAGDCCommand_tjjz", metricsLogStub},
 				{"__ZN24AppleIntelBaseController11hwSaveNVRAMEv", hwSaveNVRAMStub},
 			};
@@ -1036,11 +1104,14 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				0xA4D46,
 				0x732DC,
 				0x6DF9E,
+				0xE7A58,
 				0xA284C,
 				0x77A5A,
 			};
 			PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
 				"ngreen", "Failed to route TGL debug controller offsets");
+			routeAgdcDoAttribute(patcher, address, size);
+			routeDpbResidency(patcher, address, size);
 			
 			static const uint8_t forceWakeGTAckLoopFind[]    = {0x45, 0x38, 0xe7, 0x75, 0x9d, 0x45, 0x84, 0xe4};
 			static const uint8_t forceWakeGTAckLoopMask[]    = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -3949,6 +4020,34 @@ void Gen11::initPlatformWorkarounds(AppleIntel::AppleIntelBaseController *that)
 		SYSLOG("ngreen", "V212: ADL-P Display 13+ workarounds applied — PIPE_CHICKEN(A)=0x%x CLKGATE_DIS_5=0x%x CHICKEN_DCPR_1=0x%x ERR_FATAL_MASK=0x%x",
 			   pipeChicken, clkGateDis5, chickenDcpr1, errFatalMask);
 	}
+}
+
+static constexpr size_t kAGDCCallbackFnOffset  = 0x1c00;
+static constexpr size_t kAGDCCallbackCtxOffset = 0x1c08;
+
+static uint32_t agdcCallbackStub(void *, uint64_t, uint32_t, uint32_t)
+{
+	return 1;
+}
+
+uint64_t Gen11::tglCreateAppleGraphicsDeviceControlnub(void *that)
+{
+	if (NGreen::callback && !NGreen::callback->isRealTGL) {
+		if (that != nullptr) {
+			auto *base = static_cast<uint8_t *>(that);
+			auto **fn  = reinterpret_cast<void **>(base + kAGDCCallbackFnOffset);
+			auto **ctx = reinterpret_cast<void **>(base + kAGDCCallbackCtxOffset);
+			if (*fn == nullptr && *ctx == nullptr) {
+				*ctx = that;
+				*fn  = reinterpret_cast<void *>(agdcCallbackStub);
+			}
+		}
+
+		armAgdcNub(that, callback->otglCreateAppleGraphicsDeviceControlnub);
+
+		return kIOReturnSuccess;
+	}
+	return FunctionCast(tglCreateAppleGraphicsDeviceControlnub, callback->otglCreateAppleGraphicsDeviceControlnub)(that);
 }
 
 uint64_t Gen11::metricsLogStub(void *, uint32_t, uint32_t, uint32_t)
