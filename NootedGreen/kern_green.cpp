@@ -147,6 +147,8 @@ static void seedIGPUPropertiesEarly() {
 void NGreen::init() {
     callback = this;
 	
+	mmioLock = IOSimpleLockAlloc();
+
 	lilu.onKextLoadForce(&kextAGDP);
 	/*lilu.onKextLoadForce(&kextBacklight);
 	lilu.onKextLoadForce(&kextMCCSControl);
@@ -330,7 +332,11 @@ bool NGreen::wrapIGAccelDeviceStart(void *that) {
 void NGreen::setRMMIOIfNecessary() {
 	if (UNLIKELY(!this->rmmio || !this->rmmio->getLength())) {
 		this->rmmio = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+		if (this->rmmio && this->rmmio->getLength() >= (mmPCIE_DATA2 + 1) * sizeof(uint32_t)) {
 		this->rmmioPtr = reinterpret_cast<volatile uint32_t *>(this->rmmio->getVirtualAddress());
+		} else {
+			this->rmmioPtr = nullptr;
+		}
 	}
 }
 
