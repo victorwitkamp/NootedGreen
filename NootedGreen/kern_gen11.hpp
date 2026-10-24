@@ -1532,6 +1532,8 @@ private:
 	mach_vm_address_t osetupOptimalLaneCount {};
 	static IOReturn wrapLinkTraining(void *that, void *config);
 	mach_vm_address_t oLinkTraining {};
+	static IOReturn wrapGetDPCDInfo(void *that);
+	mach_vm_address_t oGetDPCDInfo {};
 	static IOReturn wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, uint32_t preEmphasis,
 	                                                  void *driveConfig);
 	mach_vm_address_t oSetVoltageSwing {};
@@ -1561,6 +1563,8 @@ private:
 	
 	static IOReturn wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length);
 	mach_vm_address_t orgICLReadAUX {};
+	static IOReturn wrapICLWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length);
+	mach_vm_address_t orgICLWriteAUX {};
 	static void routeAUXTransactionGuard(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
 	static void routeEnhancedFraming(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
 

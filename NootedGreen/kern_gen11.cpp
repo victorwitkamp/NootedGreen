@@ -153,6 +153,11 @@ IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
 	return ret;
 }
 
+static constexpr uint32_t kSinkD3HoldMs = 20;
+static constexpr uint32_t kPpsCycleMs  = 500u;
+static constexpr uint32_t kPpsSettleMs = 50u;
+static constexpr uint8_t kSourceOUI[3] = {0x00, 0xAA, 0x01};
+
 static bool ensureA788DisplayAWells(bool requireDDI = true);
 
 static bool isKnownTGLImage(mach_vm_address_t address, size_t size) {
@@ -711,6 +716,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort21setupOptimalLaneCountEPK29IODetailedTimingInformationV2j",setupOptimalLaneCount, this->osetupOptimalLaneCount},
 			// V97: Log AUX transactions to diagnose eDP link training failures on RPL
 			{"__ZN14AppleIntelPort7readAUXEjPvj", wrapICLReadAUX, this->orgICLReadAUX},
+			{"__ZN14AppleIntelPort8writeAUXEjPvj", wrapICLWriteAUX, this->orgICLWriteAUX},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
@@ -745,6 +751,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",   prepareToExitWake,   this->oprepareToExitWake},
 			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",  prepareToEnterWake,  this->oprepareToEnterWake},
 			{"__ZN14AppleIntelPort12linkTrainingEP18AGDCDPPortConfig_t", wrapLinkTraining, this->oLinkTraining},
+			{"__ZN14AppleIntelPort11getDPCDInfoEv", wrapGetDPCDInfo, this->oGetDPCDInfo},
 			{"__ZN17AppleIntelPortHAL29setVoltageSwingAndPreEmphasisEjjP15PortDriveConfig",
 			 wrapSetVoltageSwingAndPreEmphasis, this->oSetVoltageSwing},
 			// Keep native SST timing setup; forcing custom clocks can break CoreDisplay validation.
@@ -766,6 +773,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x2F032,
 			0x2EEBE,
 			0x28D9E,
+			0x290BE,
 			0x42874,
 			0x9E54E,
 			0x4AD5E,
@@ -778,6 +786,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x3788C,
 			0x383A8,
 			0x26C54,
+			0x2AA3C,
 			0x90588,
 		};
 		gTGLFbBase = isKnownTGLImage(address, size) ? address : 0;
@@ -2541,31 +2550,7 @@ void Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const I
 	// Call original first — handles all standard DP rates on both real TGL and spoofed paths.
 	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
 
-	// Real TGL: preserve Apple's result unchanged.
-	if (NGreen::callback->isRealTGL)
-		return;
-
-	// For !isRealTGL (RPL spoofed): Apple's DPCD-based result (MAX_LANE_COUNT) reflects
-	// the panel's capability, but UEFI/GOP may have trained the link at a different lane
-	// count.  Read DDI_BUF_CTL_A to discover the actual HW-trained lane count and
-	// override Apple's result if UEFI trained more lanes than Apple computed.
-	//
-	// DDI_BUF_CTL PORT_WIDTH field bits[3:1]:
-	//   000 = x1 (1 lane),  001 = x2 (2 lanes),  011 = x4 (4 lanes)
-	const uint32_t ddiA    = NGreen::callback->readReg32(0x64000);  // DDI_BUF_CTL_A
-	const unsigned int width   = (ddiA >> 1) & 0x7u;
-	const unsigned int hwLanes = (width >= 3) ? 4u : (width >= 1) ? 2u : 1u;
-
-	static int v90L4Logs = 0;
-	if (v90L4Logs < 10) {
-		v90L4Logs++;
-		SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u appleLC=%u DDI_BUF_CTL_A=0x%x hwLanes=%u",
-			   v90L4Logs, linkRate, bpp, *laneCount, ddiA, hwLanes);
 	}
-
-	if (hwLanes > *laneCount)
-		*laneCount = hwLanes;
-}
 
 static bool dpllValuesFor(uint8_t rateCode, uint32_t &cfgcr0, uint32_t &cfgcr1) {
 	cfgcr0 = 0x00E001A5u;
@@ -2643,7 +2628,40 @@ static constexpr uint32_t kTxDw4UpperMask   = 0x7FFC0000u;
 static volatile uint32_t  gTxDw4Upper       = 0;
 static volatile uint32_t  gTxDw4UpperValid  = 0;
 
+static volatile uint32_t gSinkPowerDone = 0;
+
+static constexpr mach_vm_address_t kWriteAUXOffset = 0x290BEu;
 using AUXFn = IOReturn (*)(void *, uint32_t, void *, uint32_t);
+
+static constexpr uint32_t kPpsPpStatus    = 0xC7200u;
+static constexpr uint32_t kPpsPpControl   = 0xC7204u;
+static constexpr uint32_t kPpsCtlOnBits   = 0x0Fu;
+static constexpr uint32_t kPpsCtlPpsOn    = 0x03u;
+static constexpr uint32_t kPpsStPpOn      = 0x80000000u;
+static constexpr uint32_t kPpsStSeqMask   = 0x30000000u;
+static constexpr uint32_t kPpsStCycleAct  = 0x08000000u;
+static constexpr uint32_t kPpsStStateMask = 0x0000000Fu;
+static constexpr uint32_t kPpsIdleOffMask = kPpsStPpOn | kPpsStSeqMask;
+static constexpr uint32_t kPpsIdleCycMask = kPpsStPpOn | kPpsStSeqMask | kPpsStCycleAct | kPpsStStateMask;
+static constexpr uint32_t kPpsIdleOnMask  = kPpsStPpOn | kPpsStSeqMask | kPpsStStateMask;
+static constexpr uint32_t kPpsIdleOnValue = kPpsStPpOn | 0x8u;
+static constexpr uint32_t kPpsPollStepMs  = 10u;
+static constexpr uint32_t kPpsPollMaxMs   = 5000u;
+static constexpr uint32_t kPpsAuxTries    = 10u;
+
+static void ppsWaitStatus(uint32_t mask, uint32_t value) {
+	auto *cb = NGreen::callback;
+	for (uint32_t elapsed = 0; (cb->readReg32(kPpsPpStatus) & mask) != value && elapsed < kPpsPollMaxMs;
+	     elapsed += kPpsPollStepMs)
+		IOSleep(kPpsPollStepMs);
+}
+
+static constexpr uint32_t kPpsSinkAddrs[] = {
+	0x000, 0x001, 0x002, 0x003, 0x004, 0x005, 0x006, 0x007, 0x008, 0x009, 0x00A, 0x00B, 0x00C, 0x00D, 0x00E, 0x00F,
+	0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107, 0x108, 0x109, 0x10A, 0x10B, 0x10C, 0x10D, 0x10E, 0x10F,
+	0x160, 0x170, 0x171, 0x172, 0x300, 0x301, 0x302, 0x600,
+	0x700, 0x701, 0x702, 0x703, 0x704, 0x705, 0x706, 0x707, 0x720, 0x721, 0x722, 0x723, 0x724, 0x725, 0x726, 0x727,
+};
 
 static constexpr uint32_t kTxTrainingEn    = 1u << 31;
 static constexpr uint32_t kTap2Disable     = 1u << 30;
@@ -2702,6 +2720,57 @@ static void fixTxDw5() {
 }
 
 IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
+	if (callback->orgICLReadAUX != 0 && gTGLFbBase != 0 && __sync_val_compare_and_swap(&gSinkPowerDone, 0u, 1u) == 0u) {
+		auto readAUX = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX);
+		auto writeAUX = reinterpret_cast<AUXFn>(gTGLFbBase + kWriteAUXOffset);
+		uint8_t value = 0xFF;
+		readAUX(that, 0x0600, &value, 1);
+		uint8_t d3 = 0x02;
+		for (uint32_t a = 0; a < 3; a++) {
+			if (writeAUX(that, 0x0600, &d3, 1) == kIOReturnSuccess) break;
+			IOSleep(1);
+		}
+		IOSleep(kSinkD3HoldMs);
+		readAUX(that, 0x0600, &value, 1);
+		auto *cb = NGreen::callback;
+		if (cb != nullptr && cb->mmioMapped()) {
+			const uint32_t status = cb->readReg32(kPpsPpStatus);
+			const uint32_t control = cb->readReg32(kPpsPpControl);
+			if ((status & kPpsStPpOn) != 0u && (control & 1u) != 0u) {
+				const uint32_t off = control & ~kPpsCtlOnBits;
+				cb->writeReg32(kPpsPpControl, off);
+				(void)cb->readReg32(kPpsPpControl);
+				ppsWaitStatus(kPpsIdleOffMask, 0u);
+				IOSleep(kPpsCycleMs);
+				ppsWaitStatus(kPpsIdleCycMask, 0u);
+				cb->writeReg32(kPpsPpControl, off | kPpsCtlPpsOn);
+				(void)cb->readReg32(kPpsPpControl);
+				ppsWaitStatus(kPpsIdleOnMask, kPpsIdleOnValue);
+				cb->writeReg32(kPpsPpControl, control);
+				(void)cb->readReg32(kPpsPpControl);
+				IOSleep(kPpsSettleMs);
+				for (uint32_t i = 0; i < kPpsAuxTries; i++) {
+					if (readAUX(that, 0x0600, &value, 1) == kIOReturnSuccess) break;
+					IOSleep(10);
+				}
+				if (that != nullptr)
+					for (uint32_t addr : kPpsSinkAddrs) readAUX(that, addr, &value, 1);
+			}
+		}
+		uint8_t oui[3] = {kSourceOUI[0], kSourceOUI[1], kSourceOUI[2]};
+		uint8_t readBack = 0xFF;
+		for (uint32_t i = 0; i < 3; i++) readAUX(that, 0x0300 + i, &readBack, 1);
+		if (writeAUX(that, 0x0300, oui, 3) != kIOReturnSuccess) {
+			for (uint32_t i = 0; i < 3; i++) writeAUX(that, 0x0300 + i, &oui[i], 1);
+		}
+		for (uint32_t i = 0; i < 3; i++) readAUX(that, 0x0300 + i, &readBack, 1);
+		uint8_t d0 = 0x01;
+		for (uint32_t a = 0; a < 3; a++) {
+			if (writeAUX(that, 0x0600, &d0, 1) == kIOReturnSuccess) break;
+			IOSleep(1);
+		}
+		readAUX(that, 0x0600, &value, 1);
+	}
 	auto *cb = NGreen::callback;
 	if (cb != nullptr && cb->mmioMapped()) {
 		const uint32_t funcBefore = cb->readReg32(kTransDdiFuncCtlA);
@@ -2819,6 +2888,12 @@ IOReturn Gen11::wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, ui
 	return ret;
 }
 
+IOReturn Gen11::wrapGetDPCDInfo(void *that) {
+	const IOReturn ret = FunctionCast(wrapGetDPCDInfo, callback->oGetDPCDInfo)(that);
+	if (ret == 0 && getMember<uint8_t>(that, 0xf) != 12u) getMember<uint8_t>(that, 0xf) = 12u;
+	return ret;
+}
+
 // setupOptimalLaneCount is called by hwSetMode to pick the lane count that gets
 // stored in the port's cached LinkConfig (and ultimately into TRANS_DDI_FUNC_CTL).
 // Apple's implementation runs: optimal = computeLaneCount(...); then caps it to
@@ -2829,7 +2904,7 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 	// Always run Apple's original first to populate all other LinkConfig fields.
 	FunctionCast(setupOptimalLaneCount, callback->osetupOptimalLaneCount)(that, timing, bpp);
 
-	if (NGreen::callback->isRealTGL)
+	if (NGreen::callback->isRealTGL || NGreen::callback->isRaptorLakeHX())
 		return;
 
 	// Read HW-trained lane count from DDI_BUF_CTL_A bits[3:1].
@@ -2838,12 +2913,7 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 	const unsigned int width   = (ddiA >> 1) & 0x7u;
 	const unsigned int hwLanes = (width >= 3) ? 4u : (width >= 1) ? 2u : 1u;
 
-	// The port object stores the cached optimal lane count at a known offset.
-	// AppleIntelPort::setupOptimalLaneCount writes fOptimalLaneCount (confirmed
-	// by IDA: str result into [x0 + offset] before returning).
-	// We patch it post-call so the cap-to-DPCD logic is overridden.
-	// Offset 0x148 is fOptimalLaneCount in AppleIntelPort on this kext version.
-	unsigned int &cached = getMember<unsigned int>(that, 0x148);
+	unsigned int &cached = getMember<unsigned int>(that, 0x124);
 
 	static int v90L5Logs = 0;
 	if (v90L5Logs < 10) {
@@ -2949,6 +3019,38 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 	}
 
 	return retVal;
+}
+
+IOReturn Gen11::wrapICLWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
+	if (callback == nullptr || callback->orgICLWriteAUX == 0)
+		return kIOReturnNotReady;
+
+	auto writeAUX = FunctionCast(wrapICLWriteAUX, callback->orgICLWriteAUX);
+
+	if (address == 0x010Au && length == 1 && buffer != nullptr && that != nullptr) {
+		uint8_t zero = 0;
+		return writeAUX(that, 0x010Au, &zero, 1u);
+	}
+
+	const int32_t idx = RAPTOR_LAKE_HX_OR(4, -1);
+
+	if (idx >= 0 && address == 0x0100 && length == 2 && buffer != nullptr && that != nullptr) {
+		auto *raw = reinterpret_cast<uint8_t *>(buffer);
+		uint8_t       lanes = raw[1];
+		uint8_t       rate  = static_cast<uint8_t>(idx);
+
+		if (callback->orgICLReadAUX != 0) {
+			uint8_t rates[16] = {};
+			FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, 0x0010, rates, sizeof(rates));
+		}
+
+		const IOReturn rLane = writeAUX(that, 0x0101, &lanes, 1);
+		const IOReturn rRate = writeAUX(that, 0x0115, &rate, 1);
+
+		return (rRate != kIOReturnSuccess) ? rRate : rLane;
+	}
+
+	return writeAUX(that, address, buffer, length);
 }
 
 IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t command, uint32_t *data, uint32_t length, bool flag) {

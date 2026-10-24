@@ -366,6 +366,9 @@ private:
 	IOSimpleLock *mmioLock {nullptr};
 };
 
+#define IS_RAPTOR_LAKE_HX() (NGreen::callback != nullptr && NGreen::callback->isRaptorLakeHX())
+#define RAPTOR_LAKE_HX_OR(a788, other) (IS_RAPTOR_LAKE_HX() ? (a788) : (other))
+
 //! Change frame-buffer count >= 2 check to >= 1.
 static const UInt8 kAGDPFBCountCheckOriginal[] = {0x02, 0x00, 0x00, 0x83, 0xF8, 0x02};
 static const UInt8 kAGDPFBCountCheckPatched[] = {0x02, 0x00, 0x00, 0x83, 0xF8, 0x01};
