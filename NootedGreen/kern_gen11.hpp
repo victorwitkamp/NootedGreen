@@ -1530,6 +1530,11 @@ private:
 	// override the cached optimal to match DDI_BUF_CTL_A instead.
 	static void setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, const IODetailedTimingInformationV2 *timing, unsigned int bpp);
 	mach_vm_address_t osetupOptimalLaneCount {};
+	static IOReturn wrapLinkTraining(void *that, void *config);
+	mach_vm_address_t oLinkTraining {};
+	static IOReturn wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, uint32_t preEmphasis,
+	                                                  void *driveConfig);
+	mach_vm_address_t oSetVoltageSwing {};
 
 	// V96: Force display online — WEG's force-online (FOD) hooks getDisplayStatus which
 	// does NOT exist in the TGL framebuffer kext, so it fails with "err 2" at boot.

@@ -668,6 +668,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// Apple's implementations are known to corrupt WS state on RPL/ADL on resume.
 			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",   prepareToExitWake,   this->oprepareToExitWake},
 			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",  prepareToEnterWake,  this->oprepareToEnterWake},
+			{"__ZN14AppleIntelPort12linkTrainingEP18AGDCDPPortConfig_t", wrapLinkTraining, this->oLinkTraining},
+			{"__ZN17AppleIntelPortHAL29setVoltageSwingAndPreEmphasisEjjP15PortDriveConfig",
+			 wrapSetVoltageSwingAndPreEmphasis, this->oSetVoltageSwing},
 			// Keep native SST timing setup; forcing custom clocks can break CoreDisplay validation.
 			//{"__ZN24AppleIntelBaseController17SetupDPSSTTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParams", SetupDPSSTTimings, this->oSetupDPSSTTimings},
 			//{"__ZN24AppleIntelBaseController12SetupTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2P10CRTCParams", SetupTimings, this->oSetupTimings},
@@ -698,6 +701,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x8DE14,
 			0x3788C,
 			0x383A8,
+			0x26C54,
+			0x90588,
 		};
 		gTGLFbBase = isKnownTGLImage(address, size) ? address : 0;
 		PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
@@ -2461,6 +2466,245 @@ void Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const I
 		*laneCount = hwLanes;
 }
 
+static bool dpllValuesFor(uint8_t rateCode, uint32_t &cfgcr0, uint32_t &cfgcr1) {
+	cfgcr0 = 0x00E001A5u;
+	switch (rateCode) {
+		case 0x06: cfgcr1 = 0x90u; return true;
+		case 0x0a: cfgcr1 = 0x88u; return true;
+		case 0x0c: cfgcr1 = 0x50u; return true;
+		case 0x14: cfgcr1 = 0x48u; return true;
+		case 0x1e: cfgcr1 = 0x44u; return true;
+		default:   cfgcr1 = 0;     return false;
+	}
+}
+
+static void programDPLL0(uint8_t rateCode) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return;
+
+	constexpr uint32_t kDPLL0Enable = 0x46010u;
+	constexpr uint32_t kCfgcr0      = 0x164284u;
+	constexpr uint32_t kCfgcr1      = 0x164288u;
+	constexpr uint32_t kDdiBufCtlA  = 0x64000u;
+	constexpr uint32_t kPllEnable   = 1u << 31;
+	constexpr uint32_t kPllLock     = 1u << 30;
+
+	uint32_t wantC0 = 0, wantC1 = 0;
+	if (!dpllValuesFor(rateCode, wantC0, wantC1)) {
+		return;
+	}
+
+	const uint32_t curC0 = cb->readReg32(kCfgcr0);
+	const uint32_t curC1 = cb->readReg32(kCfgcr1);
+	const uint32_t ddiA  = cb->readReg32(kDdiBufCtlA);
+
+	if (curC0 == wantC0 && curC1 == wantC1) {
+		return;
+	}
+
+	if ((ddiA & 0x80000000u) != 0) {
+		return;
+	}
+
+	cb->intel_de_rmw(kDPLL0Enable, kPllEnable, 0);
+	for (int i = 0; i < 1000; i++) {
+		if ((cb->readReg32(kDPLL0Enable) & kPllLock) == 0) break;
+		IODelay(1);
+	}
+
+	cb->writeReg32(kCfgcr0, wantC0);
+	cb->writeReg32(kCfgcr1, wantC1);
+
+	cb->intel_de_rmw(kDPLL0Enable, 0, kPllEnable);
+	for (int i = 0; i < 1000; i++) {
+		if ((cb->readReg32(kDPLL0Enable) & kPllLock) != 0) break;
+		IODelay(1);
+	}
+}
+
+static constexpr uint32_t kPhyA        = 0x162000u;
+static constexpr uint32_t kPhyTxDw5Ln0    = kPhyA + 0x894u;
+static constexpr uint32_t kPhyTxDw5Grp    = kPhyA + 0x694u;
+static constexpr uint32_t kPhyTxDw2Ln0    = kPhyA + 0x888u;
+static constexpr uint32_t kPhyDpTpCtlA    = 0x60540u;
+static constexpr uint32_t kPhyDpTpStatusA = 0x60544u;
+
+static constexpr uint32_t kPhyLaneStride  = 0x100u;
+static constexpr uint32_t kPhyTxDw2Grp    = kPhyA + 0x688u;
+static constexpr uint32_t kPhyTxDw4Ln0    = kPhyA + 0x890u;
+static constexpr uint32_t kPhyTxDw7Ln0    = kPhyA + 0x89cu;
+static constexpr uint32_t kLoadgenSelect   = 1u << 31;
+static constexpr uint32_t kDw4CoeffMask    = 0x3FFFFu;
+static constexpr uint32_t kDw2ClearMask    = 0xffff4700u;
+static constexpr uint32_t kNScalarMask     = 0x7Fu << 24;
+
+static constexpr uint32_t kTxDw4UpperMask   = 0x7FFC0000u;
+static volatile uint32_t  gTxDw4Upper       = 0;
+static volatile uint32_t  gTxDw4UpperValid  = 0;
+
+using AUXFn = IOReturn (*)(void *, uint32_t, void *, uint32_t);
+
+static constexpr uint32_t kTxTrainingEn    = 1u << 31;
+static constexpr uint32_t kTap2Disable     = 1u << 30;
+static constexpr uint32_t kTap3Disable     = 1u << 29;
+static constexpr uint32_t kCursorProgram   = 1u << 26;
+static constexpr uint32_t kCoeffPolarity   = 1u << 25;
+static constexpr uint32_t kScalingModeMask = 0x7u << 18;
+static constexpr uint32_t kRtermSelectMask = 0x7u << 3;
+
+static volatile uint32_t gPhyTraining = 0;
+static volatile uint32_t gPhyProbed   = 0;
+
+static constexpr uint32_t kDpTpCtlLinkTrainMask = 0x7u << 8;
+static constexpr uint32_t kDpTpCtlLinkTrainIdle = 0x2u << 8;
+static constexpr uint32_t kDpTpStatusIdleDone   = 1u << 25;
+
+static void dpclkaOneShot(void *that, AUXFn aux) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return;
+	auto R = [cb](uint32_t reg) { return cb->readReg32(reg); };
+	auto W = [cb](uint32_t reg, uint32_t val) { cb->writeReg32(reg, val); (void)cb->readReg32(reg); };
+
+	uint8_t rs = 0xFF, tbl[16];
+	for (unsigned i = 0; i < sizeof(tbl); i++) tbl[i] = 0xFF;
+	aux(that, 0x0115, &rs, 1);
+	aux(that, 0x0010, tbl, sizeof(tbl));
+
+	const uint32_t cur  = R(kPhyDpTpCtlA);
+	const uint32_t idle = (cur & ~kDpTpCtlLinkTrainMask) | kDpTpCtlLinkTrainIdle;
+	W(kPhyDpTpCtlA, idle);
+	for (int i = 0; i < 1000; i++) {
+		if ((R(kPhyDpTpStatusA) & kDpTpStatusIdleDone) != 0) break;
+		IODelay(1);
+	}
+	W(kPhyDpTpCtlA, cur);
+	R(kPhyDpTpStatusA);
+}
+
+static void fixTxDw5() {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return;
+
+	const uint32_t cur = cb->readReg32(kPhyTxDw5Ln0);
+
+	uint32_t want = cur;
+	want &= ~(kScalingModeMask | kRtermSelectMask | kCoeffPolarity | kCursorProgram |
+	          kTap2Disable | kTap3Disable);
+	want |= (2u << 18);
+	want |= (6u << 3);
+	want |= kTap3Disable;
+
+	if (want == cur) return;
+
+	cb->writeReg32(kPhyTxDw5Grp, want & ~kTxTrainingEn);
+	cb->writeReg32(kPhyTxDw5Grp, want | kTxTrainingEn);
+}
+
+IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
+	auto *cb = NGreen::callback;
+	programDPLL0(getMember<uint8_t>(that, 0xf));
+	__sync_add_and_fetch(&gPhyTraining, 1u);
+	const IOReturn ret = FunctionCast(wrapLinkTraining, callback->oLinkTraining)(that, config);
+	__sync_sub_and_fetch(&gPhyTraining, 1u);
+	return ret;
+}
+
+struct PhyDriveEntry { uint8_t swingSel, nScalar, cursorCoeff, postCursor2, postCursor1; };
+static const PhyDriveEntry kPhyAdlsEdpHbr2[10] = {
+	{0x9, 0x73, 0x3D, 0x00, 0x02},
+	{0x9, 0x7A, 0x3C, 0x00, 0x03},
+	{0x9, 0x7F, 0x3B, 0x00, 0x04},
+	{0x4, 0x6C, 0x33, 0x00, 0x0C},
+	{0x2, 0x73, 0x3A, 0x00, 0x05},
+	{0x2, 0x7C, 0x38, 0x00, 0x07},
+	{0x4, 0x5A, 0x36, 0x00, 0x09},
+	{0x4, 0x57, 0x3D, 0x00, 0x02},
+	{0x4, 0x65, 0x38, 0x00, 0x07},
+	{0x4, 0x6C, 0x3A, 0x00, 0x05},
+};
+
+static int driveLevelFor(uint32_t swing, uint32_t preEmph) {
+	static const int8_t kGrid[4][4] = {
+		{ 0,  1,  2,  3},
+		{ 4,  5,  6, -1},
+		{ 7,  8, -1, -1},
+		{ 9, -1, -1, -1},
+	};
+	if (swing > 3 || preEmph > 3) return -1;
+	return kGrid[swing][preEmph];
+}
+
+static void fixDriveEntry(uint32_t swing, uint32_t preEmph, uint32_t laneCount) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return;
+
+	const int level = driveLevelFor(swing, preEmph);
+	if (level < 0) return;
+	const PhyDriveEntry &e = kPhyAdlsEdpHbr2[level];
+
+	const uint32_t dw5 = cb->readReg32(kPhyTxDw5Ln0);
+	cb->writeReg32(kPhyTxDw5Grp, dw5 & ~kTxTrainingEn);
+
+	const uint32_t dw2cur = cb->readReg32(kPhyTxDw2Ln0);
+	const uint32_t dw2    = (dw2cur & kDw2ClearMask) | ((e.swingSel & 0x8u) << 12) |
+	                        ((e.swingSel & 0x7u) << 11) | 0x98u;
+	cb->writeReg32(kPhyTxDw2Grp, dw2);
+
+	const uint32_t coeff = (static_cast<uint32_t>(e.postCursor1) << 12) |
+	                       (static_cast<uint32_t>(e.postCursor2) << 6) |
+	                       static_cast<uint32_t>(e.cursorCoeff);
+	uint32_t txDw4Upper = 0;
+	bool     txDw4Have  = false;
+	if (gTxDw4UpperValid) {
+		txDw4Upper = gTxDw4Upper;
+		txDw4Have  = true;
+	} else {
+		for (uint32_t ln = 0; ln < 4; ln++) {
+			const uint32_t u = cb->readReg32(kPhyTxDw4Ln0 + ln * kPhyLaneStride) & kTxDw4UpperMask;
+			if (u != 0) {
+				txDw4Upper      = u;
+				txDw4Have       = true;
+				gTxDw4Upper     = u;
+				gTxDw4UpperValid = 1;
+				break;
+			}
+		}
+	}
+
+	for (uint32_t ln = 0; ln < 4; ln++) {
+		const uint32_t reg = kPhyTxDw4Ln0 + ln * kPhyLaneStride;
+		const uint32_t cur = cb->readReg32(reg);
+		const bool loadgen = (laneCount == 4) ? (ln >= 1) : (ln == 1 || ln == 2);
+		uint32_t want = (cur & ~kDw4CoeffMask) | coeff;
+		want = loadgen ? (want | kLoadgenSelect) : (want & ~kLoadgenSelect);
+		if (txDw4Have) want = (want & ~kTxDw4UpperMask) | txDw4Upper;
+		if (want != cur) cb->writeReg32(reg, want);
+	}
+
+	for (uint32_t ln = 0; ln < 4; ln++) {
+		const uint32_t reg = kPhyTxDw7Ln0 + ln * kPhyLaneStride;
+		const uint32_t cur = cb->readReg32(reg);
+		const uint32_t want = (cur & ~kNScalarMask) | (static_cast<uint32_t>(e.nScalar) << 24);
+		if (want != cur) cb->writeReg32(reg, want);
+	}
+
+	cb->writeReg32(kPhyTxDw5Grp, cb->readReg32(kPhyTxDw5Ln0) | kTxTrainingEn);
+}
+
+IOReturn Gen11::wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, uint32_t preEmphasis,
+                                                 void *driveConfig) {
+	const IOReturn ret = FunctionCast(wrapSetVoltageSwingAndPreEmphasis, callback->oSetVoltageSwing)(
+		that, swing, preEmphasis, driveConfig);
+
+	if (gPhyTraining != 0) {
+		uint32_t lanes = getMember<uint32_t>(that, 0x124);
+		if (lanes != 1 && lanes != 2 && lanes != 4) lanes = 2;
+		fixDriveEntry(swing, preEmphasis, lanes);
+		fixTxDw5();
+	}
+	return ret;
+}
+
 // setupOptimalLaneCount is called by hwSetMode to pick the lane count that gets
 // stored in the port's cached LinkConfig (and ultimately into TRANS_DDI_FUNC_CTL).
 // Apple's implementation runs: optimal = computeLaneCount(...); then caps it to
@@ -2515,6 +2759,15 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 		else
 			SYSLOG("ngreen", "V97AUX[%d]: addr=0x%04x len=%u ret=0x%x",
 				   auxLogCount, address, length, retVal);
+	}
+
+	if (gPhyTraining != 0 && address == 0x0202 && __sync_val_compare_and_swap(&gPhyProbed, 0u, 1u) == 0u) {
+		auto readAUX = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX);
+		uint8_t lc[2] = {0xFF, 0xFF};
+		uint8_t sw[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+		readAUX(that, 0x0100, lc, sizeof(lc));
+		readAUX(that, 0x0103, sw, sizeof(sw));
+		dpclkaOneShot(that, readAUX);
 	}
 
 	// V98T removed: do NOT clamp DPCD[0x0100-0x0101] (LINK_BW_SET / LANE_COUNT_SET).

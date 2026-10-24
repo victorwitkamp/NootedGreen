@@ -75,6 +75,8 @@ class NGreen {
 	UInt32 stolen_size;
 	uint32_t framebufferId {0};
 	
+	bool mmioMapped() const { return rmmio != nullptr && rmmioPtr != nullptr; }
+
 	// Public MMIO register access (used by display link training, display merge, etc.)
 	UInt32 readReg32(unsigned long reg) {
 		if (!rmmio || !rmmioPtr || reg > 0xFFFFFFFFUL) return 0;
