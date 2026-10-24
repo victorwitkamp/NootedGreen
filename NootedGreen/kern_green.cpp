@@ -40,6 +40,43 @@ static Gen11 gen11;
 static DYLDPatches dyldpatches;
 static HDMI agfxhda;
 
+extern uint8_t *gIOFBVerbosePtr, *gIOFBBlackPtr;
+extern mach_vm_address_t gOrgInitFB;
+extern volatile uint32_t gBootFillRouted;
+void wrapInitFB(void *fb);
+
+static uint8_t *flagFromCmp(mach_vm_address_t fn, uint32_t off) {
+	if (fn == 0) return nullptr;
+	const uint8_t *p = reinterpret_cast<const uint8_t *>(fn + off);
+	if (p[0] != 0x80 || p[1] != 0x3d || p[6] != 0x00) return nullptr;
+	int32_t rel = 0;
+	lilu_os_memcpy(&rel, p + 2, sizeof(rel));
+	return reinterpret_cast<uint8_t *>(fn + off + 7 + static_cast<int64_t>(rel));
+}
+
+static void __attribute__((noinline)) routeBootFill(KernelPatcher &patcher, size_t index, mach_vm_address_t address,
+                                                 size_t size) {
+	const mach_vm_address_t initFB = patcher.solveSymbol(index, "__ZN13IOFramebuffer6initFBEv");
+	if (initFB == 0) patcher.clearError();
+	const mach_vm_address_t bootFill = patcher.solveSymbol(index, "__ZL23IOFramebufferBootInitFByjjjjh");
+	if (bootFill == 0) patcher.clearError();
+	const bool inText = initFB >= address && initFB + 0x2c3 <= address + size && bootFill >= address
+	                    && bootFill + 0x2e <= address + size;
+	uint8_t *vp = inText ? flagFromCmp(initFB, 0x2bc) : nullptr;
+	uint8_t *bp = inText ? flagFromCmp(bootFill, 0x27) : nullptr;
+	uint32_t mask = 0;
+	if (vp != nullptr) mask |= 1u << 1;
+	if (bp != nullptr) mask |= 1u << 2;
+	gIOFBVerbosePtr = vp;
+	gIOFBBlackPtr = bp;
+	RouteRequestPlus req[] = {
+		{"__ZN13IOFramebuffer6initFBEv", wrapInitFB, gOrgInitFB},
+	};
+	if (RouteRequestPlus::routeAll(patcher, index, req, address, size)) mask |= 1u << 0;
+	else patcher.clearError();
+	__sync_fetch_and_or(&gBootFillRouted, mask);
+}
+
 static void __attribute__((noinline)) patchIOGraphics(KernelPatcher &patcher, size_t index,
                                                            mach_vm_address_t address, size_t size) {
 	static const uint8_t fbStartFind[]    = {0x48, 0x85, 0xc0, 0x74, 0x5b, 0x48, 0x8b, 0x3d, 0x1d, 0xac, 0x02, 0x00};
@@ -51,6 +88,7 @@ static void __attribute__((noinline)) patchIOGraphics(KernelPatcher &patcher, si
 	fbStartPatch.apply(patcher, address, size);
 	patcher.clearError();
 
+	routeBootFill(patcher, index, address, size);
 }
 
 static uint8_t builtin2[] = {0x00, 0x00, 0x49, 0x9A};

@@ -339,6 +339,8 @@ class NGreen {
     bool isGen8LPDerivative = false;
     bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
 public:
+	uint64_t bootApertureLen() const { return apertureLen; }
+	IOPCIDevice *gpuDevice() const { return iGPU; }
     bool getIsRealTGL() const { return isRealTGL; }
 	bool isRaptorLakeHX() const { return deviceId == 0xA788; }
 private:

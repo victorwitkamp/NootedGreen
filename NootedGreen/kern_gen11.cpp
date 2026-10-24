@@ -4742,6 +4742,58 @@ uint8_t Gen11::hwRegsNeedUpdate
 	return FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
 }
 
+uint8_t *gIOFBVerbosePtr = nullptr, *gIOFBBlackPtr = nullptr;
+mach_vm_address_t gOrgInitFB = 0;
+volatile uint32_t gBootFillRouted = 0;
+static volatile uint32_t gBootFillCanary = 0;
+
+void wrapInitFB(void *fb) {
+	uint8_t *vp = gIOFBVerbosePtr, *bp = gIOFBBlackPtr;
+	const uint8_t v0 = vp != nullptr ? *vp : 0xffu, b0 = bp != nullptr ? *bp : 0xffu;
+	uint32_t canary = gBootFillCanary;
+	if (canary == 0 && vp != nullptr) {
+		canary = (v0 == 0 && b0 <= 1u) ? 1u : 2u;
+		gBootFillCanary = canary;
+	}
+	const bool force = vp != nullptr && bp != nullptr && canary == 1 && (gBootFillRouted & 0x7u) == 0x7u;
+	if (force) { *vp = 1; *bp = 1; }
+	FunctionCast(wrapInitFB, gOrgInitFB)(fb);
+	if (force) { *vp = v0; *bp = b0; }
+}
+
+static void bootFillZero(uint32_t surf, uint64_t len) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || cb->gpuDevice() == nullptr || len == 0) return;
+	IODeviceMemory *bar = cb->gpuDevice()->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+	if (bar == nullptr || static_cast<uint64_t>(surf) + len > bar->getLength()) return;
+	IODeviceMemory *sub = IODeviceMemory::withSubRange(bar, surf, static_cast<IOPhysicalLength>(len));
+	if (sub == nullptr) return;
+	IOMemoryMap *map = sub->map(kIOMapWriteCombineCache);
+	if (map != nullptr) {
+		bzero(reinterpret_cast<void *>(static_cast<uintptr_t>(map->getVirtualAddress())), static_cast<size_t>(len));
+		asm volatile("sfence" ::: "memory");
+		map->release();
+	}
+	sub->release();
+}
+
+static void bootFillAfterSetup(void *fb, bool isAperture, bool required, int ret) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || fb == nullptr || !isAperture || !required || ret != 0) return;
+	const uint32_t surf = getMember<uint32_t>(fb, 0x4330), stride = getMember<uint32_t>(fb, 0x4334);
+	const uint32_t idx = getMember<uint8_t>(fb, 0x4288);
+	if (idx > 31u) return;
+	const uint32_t lo = cb->readReg32(0x100000u + idx * 8u), hi = cb->readReg32(0x100004u + idx * 8u);
+	const bool fenced = (lo & 1u) != 0 && (lo & 0xfffff000u) == (surf & 0xfffff000u) && stride >= 512u
+	                    && (hi & 0x7ffu) == (stride >> 7) - 1u;
+	const uint32_t h = (cb->readReg32(0x6001C) & 0x1fffu) + 1u;
+	const uint64_t len = static_cast<uint64_t>(stride) * h;
+	cb->setApertureIfNecessary();
+	const bool sane = fenced && h >= 480u && h <= 4320u && stride <= 65536u && len <= (64ull << 20)
+	                  && static_cast<uint64_t>(surf) + len <= cb->bootApertureLen();
+	if (sane) bootFillZero(surf, len);
+}
+
 int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb, AppleIntel::AppleIntelDisplayPath *displayPath, AppleIntel::CRTCParams *params, bool isAperture)
 {
 	int ret = FunctionCast(wrapHwSetupMemory, callback->ohwSetupMemory)(that, fb, displayPath, params, isAperture);
@@ -4781,6 +4833,9 @@ int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIn
 			   v201Count, ret, fb, surfAddr, fbSize, fbIdx, yTileFlg, tlCtr, ctr, bar, mid,
 			   pteHi, pteLo, pteLo & 1, (pteLo >> 3) & 1);
 	}
+
+	bootFillAfterSetup(fb, isAperture, callback != nullptr && callback->oIsApertureMemoryRequired != 0
+	               && FunctionCast(wrapIsApertureMemoryRequired, callback->oIsApertureMemoryRequired)(fb), ret);
 
 	return ret;
 }
