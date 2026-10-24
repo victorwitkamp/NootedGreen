@@ -202,6 +202,8 @@ static constexpr uint64_t kL3AddrMask    = 0x0000FFFFFFFFF000ull;
 static uint64_t *volatile gPhysmapBase = nullptr;
 static uint64_t *volatile gPhysmapMax  = nullptr;
 
+static uint32_t uptimeMs();
+
 extern volatile uint64_t gStolenLo, gStolenHi;
 extern volatile uint32_t gStolenState;
 static volatile uint32_t *physToVirt(uint64_t pa, uint32_t bytes) {
@@ -385,6 +387,7 @@ static void applyContextWa(NGreen *cb, void *ctx) {
 static constexpr uint32_t kDsbSizePatchAt = 10;
 static const uint8_t kDsbSizePre[] = {0x49, 0x8d, 0x44, 0x0c, 0xff, 0x31, 0xd2, 0x48, 0xf7, 0xf1,
                                    0x25, 0xff, 0xff, 0x0f, 0x00, 0x49, 0x09, 0xf3};
+static uint32_t uptimeMs();
 
 static void patchDsbSize(mach_vm_address_t address, size_t size) {
 	uint8_t post[sizeof(kDsbSizePre)];
@@ -1172,6 +1175,80 @@ static void waitPageon(void *that, void *event) {
 	}
 }
 
+static volatile uint32_t gNotReadyRun = 0;
+static uint32_t surfaceAddr(const void *res) {
+	if (res == nullptr) return 0;
+	auto *r = static_cast<const uint8_t *>(res);
+	auto *map = *reinterpret_cast<const uint8_t *const *>(r + 0x40);
+	if (map == nullptr) return 0;
+	uint64_t a = *reinterpret_cast<const uint64_t *>(map + 0x98);
+	const uint8_t t = r[0x14];
+	if (t == 0 || t == 0x80) a += *reinterpret_cast<const uint64_t *>(r + 0xF8);
+	else if (t == 0x82) a += *reinterpret_cast<const uint32_t *>(r + 0xFC);
+	return static_cast<uint32_t>(a);
+}
+uint64_t wrapSubmitFlipBuffer(void *pipe, void *ev, uint32_t flags, void *res, void *res2);
+uint64_t wrapGenerateFlip(void *pipe, void *ev, uint32_t flags, void *res, void *res2);
+uint64_t wrapBackBufferReady(void *surf, uint32_t fb);
+
+static constexpr uint32_t kFlipSettleMs = 50, kNotReadyRunPolls = 8, kReflipGapMs = 250, kMaxReflips = 16;
+static constexpr uint32_t kMaxFlipRequests = 256, kStuckFlipFbs = 4;
+static void *volatile gFlipPipe[kStuckFlipFbs] = {};
+static volatile uint32_t gFlipCacheMs[3] = {};
+static volatile uint32_t gFlipRequests = 0, gReflips = 0;
+static volatile uint32_t gNotReadyRunStartMs = 0, gLastReflipMs = 0, gInReflip = 0;
+
+static uint32_t readPlaneSurf(int32_t idx) {
+	if (idx < 0 || idx > 2 || NGreen::callback == nullptr || !NGreen::callback->mmioMapped()) return 0;
+	return NGreen::callback->readReg32(0x7019Cu + static_cast<uint32_t>(idx) * 0x1000u) & ~0xfffu;
+}
+static bool displayPipeIdle(const uint8_t *p) {
+	return *reinterpret_cast<const int32_t *>(p + 0x238) == *reinterpret_cast<const int32_t *>(p + 0x23c) &&
+	       *reinterpret_cast<const uint64_t *>(p + 0x248) == 0;
+}
+static uint32_t fixDuplicateFlip(void *pipe, uint32_t est, uint32_t cache) {
+	if (pipe == nullptr) return 0;
+	auto *p = static_cast<uint8_t *>(pipe);
+	const uint32_t fb = *reinterpret_cast<const uint32_t *>(p + 0x284);
+	if (fb < kStuckFlipFbs) gFlipPipe[fb] = pipe;
+	const int32_t idx = *reinterpret_cast<const int32_t *>(p + 0x1334);
+	if (est == 0 || est != cache || idx < 0 || idx > 2 || p[0x298] == 0) return 0;
+	const uint32_t surf = readPlaneSurf(idx);
+	if (surf == 0 || surf == est) return 0;
+	const uint32_t now = uptimeMs(), age = now - gFlipCacheMs[idx];
+	const bool idle = displayPipeIdle(p) && age >= kFlipSettleMs;
+	if (idle && gFlipRequests < kMaxFlipRequests) {
+		*reinterpret_cast<uint64_t *>(p + 0x12c8) = surf;
+		__sync_add_and_fetch(&gFlipRequests, 1u);
+		return 1;
+	}
+	return 0;
+}
+extern mach_vm_address_t gOrgSubmitFlipBuffer, gOrgGenerateFlip, gOrgBackBufferReady;
+static void reflipIfStuck(void *surf, uint32_t fb, uint32_t n) {
+	if (gInReflip != 0 || n < kNotReadyRunPolls || gOrgSubmitFlipBuffer == 0) return;
+	const uint32_t now = uptimeMs(), run = now - gNotReadyRunStartMs;
+	if (run < kFlipSettleMs || now - gLastReflipMs < kReflipGapMs) return;
+	void *pipe = fb < kStuckFlipFbs ? gFlipPipe[fb] : nullptr;
+	if (pipe == nullptr) return;
+	auto *pp = static_cast<uint8_t *>(pipe);
+	auto *s = static_cast<const uint8_t *>(surf);
+	void *front = *reinterpret_cast<void *const *>(s + 0x11c0);
+	const uint32_t fa = surfaceAddr(front), ba = surfaceAddr(*reinterpret_cast<void *const *>(s + 0x11c8));
+	const int32_t idx = *reinterpret_cast<const int32_t *>(pp + 0x1334);
+	const uint32_t reg = readPlaneSurf(idx);
+	if (pp[0x298] == 0 || fa == 0 || ba == 0 || fa == ba || reg != ba) return;
+	if (!displayPipeIdle(pp) || gReflips >= kMaxReflips) return;
+	gLastReflipMs = now;
+	const uint32_t cache = static_cast<uint32_t>(*reinterpret_cast<const uint64_t *>(pp + 0x12c8));
+	if (cache == fa) *reinterpret_cast<uint64_t *>(pp + 0x12c8) = reg;
+	__sync_add_and_fetch(&gReflips, 1u);
+	gInReflip = 1;
+	FunctionCast(wrapSubmitFlipBuffer, gOrgSubmitFlipBuffer)(pipe, nullptr, 0, front, nullptr);
+	gInReflip = 0;
+	gFlipCacheMs[idx] = uptimeMs();
+}
+
 static constexpr uint32_t kDpTpEnhancedFrame = 0x40000u;
 static constexpr uint32_t kDpTpCtlA      = 0x60540u;
 
@@ -1349,6 +1426,13 @@ static void scanoutSnapshot(bool late) {
 	if (late && cb->isRaptorLakeHX() && gAuxSeen)
 		ensureA788DisplayAWells(false);
 	clearDssOnce();
+}
+
+static uint32_t uptimeMs() {
+	uint64_t abs = 0, ns = 0;
+	clock_get_uptime(&abs);
+	absolutetime_to_nanoseconds(abs, &ns);
+	return (uint32_t)(ns / 1000000ull);
 }
 
 static constexpr uint64_t kResolvePoolWindow = 0xff8;
@@ -2712,6 +2796,21 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			for (auto &e : timerRoutes) {
 				RouteRequestPlus one[] = {{e.sym, e.wrap, e.org}};
 				if (gTimerLock == nullptr || !RouteRequestPlus::routeAll(patcher, index, one, address, size)) patcher.clearError();
+			}
+		}
+
+		{
+			struct { const char *sym; mach_vm_address_t wrap; mach_vm_address_t &org; } flipRoutes[] = {
+				{"__ZN18IGAccelDisplayPipe16submitFlipBufferEP12IOAccelEventjP16IOAccelResource2S3_",
+				 reinterpret_cast<mach_vm_address_t>(wrapSubmitFlipBuffer), gOrgSubmitFlipBuffer},
+				{"__ZN18IGAccelDisplayPipe12generateFlipEP12IOAccelEventjP16IOAccelResource2S3_",
+				 reinterpret_cast<mach_vm_address_t>(wrapGenerateFlip), gOrgGenerateFlip},
+				{"__ZN14IGAccelSurface17isBackBufferReadyEj",
+				 reinterpret_cast<mach_vm_address_t>(wrapBackBufferReady), gOrgBackBufferReady},
+			};
+			for (auto &e : flipRoutes) {
+				RouteRequestPlus one[] = {{e.sym, e.wrap, e.org}};
+				if (!RouteRequestPlus::routeAll(patcher, index, one, address, size)) patcher.clearError();
 			}
 		}
 
@@ -10765,6 +10864,35 @@ uint64_t Gen11::wrapDisablePeriodic(void *sched, void *src) {
 	}
 	if (unmatched) return 0;
 	return FunctionCast(wrapDisablePeriodic, callback->oDisablePeriodic)(sched, src);
+}
+
+mach_vm_address_t gOrgSubmitFlipBuffer = 0, gOrgGenerateFlip = 0, gOrgBackBufferReady = 0;
+static volatile uint32_t gFlipGenSeen = 0;
+uint64_t wrapGenerateFlip(void *pipe, void *ev, uint32_t flags, void *res, void *res2) {
+	gFlipGenSeen = 1;
+	return FunctionCast(wrapGenerateFlip, gOrgGenerateFlip)(pipe, ev, flags, res, res2);
+}
+uint64_t wrapSubmitFlipBuffer(void *pipe, void *ev, uint32_t flags, void *res, void *res2) {
+	auto *p = static_cast<const uint8_t *>(pipe);
+	fixDuplicateFlip(pipe, surfaceAddr(res), p ? static_cast<uint32_t>(*reinterpret_cast<const uint64_t *>(p + 0x12c8)) : 0);
+	gFlipGenSeen = 0;
+	const uint64_t r = FunctionCast(wrapSubmitFlipBuffer, gOrgSubmitFlipBuffer)(pipe, ev, flags, res, res2);
+	if (gFlipGenSeen != 0 && p != nullptr) {
+		const int32_t idx = *reinterpret_cast<const int32_t *>(p + 0x1334);
+		if (idx >= 0 && idx <= 2) gFlipCacheMs[idx] = uptimeMs();
+	}
+	return r;
+}
+uint64_t wrapBackBufferReady(void *surf, uint32_t fb) {
+	const uint64_t r = FunctionCast(wrapBackBufferReady, gOrgBackBufferReady)(surf, fb);
+	if ((r & 0xffu) == 0) {
+		const uint32_t n = __sync_add_and_fetch(&gNotReadyRun, 1u);
+		if (n == 1) gNotReadyRunStartMs = uptimeMs();
+		if (surf != nullptr) reflipIfStuck(surf, fb, n);
+	} else {
+		gNotReadyRun = 0;
+	}
+	return r;
 }
 
 // V54: IRQ watchdog — re-enables Master IRQ if the driver disables it during init.
