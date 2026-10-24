@@ -68,6 +68,21 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	}
 
     if (!UserPatcher::matchSharedCachePath(path)) {
+
+		if (strstr(path, kIGCPluginBundlePath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLibLLVMDepOriginal, arrsize(kLibLLVMDepOriginal),
+					kLibLLVMDepPatched, arrsize(kLibLLVMDepPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCRtTGLGpuencodePathOriginal, arrsize(kIGCRtTGLGpuencodePathOriginal),
+					kIGCRtTGLGpuencodePathPatched, arrsize(kIGCRtTGLGpuencodePathPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCRtIgc64PathOriginal, arrsize(kIGCRtIgc64PathOriginal),
+					kIGCRtIgc64PathPatched, arrsize(kIGCRtIgc64PathPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCRtIgcHSW64PathOriginal, arrsize(kIGCRtIgcHSW64PathOriginal),
+					kIGCRtIgcHSW64PathPatched, arrsize(kIGCRtIgcHSW64PathPatched));
+			}
+			return;
+		}
+
         if (LIKELY(strncmp(path, kCoreLSKDMSEPath, arrsize(kCoreLSKDMSEPath))) ||
             LIKELY(strncmp(path, kCoreLSKDPath, arrsize(kCoreLSKDPath)))) {
             return;

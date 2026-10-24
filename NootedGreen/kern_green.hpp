@@ -72,6 +72,15 @@ class NGreen {
 	mach_vm_address_t orgApplePanelSetDisplay {0};
 	static bool wrapApplePanelSetDisplay(IOService *that, IODisplay *display);
 	
+	mach_vm_address_t orgSbEvaluateInternal {0};
+	static uint64_t wrapSbEvaluateInternal(void *label, uint32_t operation, void *context, void *block);
+	int (*orgVnGetPath)(void *vp, char *pathbuf, int *len) {nullptr};
+	static bool isUnderGpuBundles(void *vp);
+	mach_vm_address_t orgFileCheckLibraryValidation {0};
+	static int wrapFileCheckLibraryValidation(void *proc, void *fileglob, uint64_t sliceOffset,
+		uint64_t errMsg, uint64_t errMsgSize);
+	void *(*orgFgGetVnode)(void *fileglob) {nullptr};
+
 	UInt32 stolen_size;
 	uint32_t framebufferId {0};
 	

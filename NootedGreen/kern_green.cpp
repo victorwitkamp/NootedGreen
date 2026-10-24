@@ -33,6 +33,14 @@ static const char *pathAppleGraphicsDeviceControl = "/System/Library/Extensions/
 static KernelPatcher::KextInfo kextAppleGraphicsDeviceControl { "com.apple.AppleGraphicsDeviceControl", &pathAppleGraphicsDeviceControl, 1, {true}, {},
 	KernelPatcher::KextInfo::Unloaded };
 
+static const char *pathSandbox = "/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox";
+static KernelPatcher::KextInfo kextSandbox { "com.apple.security.sandbox", &pathSandbox, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded };
+
+static const char *pathAMFI = "/System/Library/Extensions/AppleMobileFileIntegrity.kext/Contents/MacOS/AppleMobileFileIntegrity";
+static KernelPatcher::KextInfo kextAMFI { "com.apple.driver.AppleMobileFileIntegrity", &pathAMFI, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded };
+
 NGreen *NGreen::callback = nullptr;
 
 static Genx genx;
@@ -209,6 +217,8 @@ void NGreen::init() {
 	lilu.onKextLoadForce(&kextIOGraphics);
 	lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
 	lilu.onKextLoadForce(&kextAppleGraphicsDeviceControl);
+	lilu.onKextLoadForce(&kextSandbox);
+	lilu.onKextLoadForce(&kextAMFI);
 	
 	genx.init();
 	gen11.init();
@@ -228,6 +238,18 @@ void NGreen::init() {
 
 
 void NGreen::processPatcher(KernelPatcher &patcher) {
+	if (!orgVnGetPath) {
+		orgVnGetPath = reinterpret_cast<int (*)(void *, char *, int *)>(
+			patcher.solveSymbol(KernelPatcher::KernelID, "_vn_getpath"));
+		patcher.clearError();
+	}
+
+	if (!orgFgGetVnode) {
+		orgFgGetVnode = reinterpret_cast<void *(*)(void *)>(
+			patcher.solveSymbol(KernelPatcher::KernelID, "_fg_get_vnode"));
+		patcher.clearError();
+	}
+
 	// Hook _cs_validate_page FIRST — before DeviceInfo which blocks
 	// for >60s polling PEGP (NVIDIA dGPU) disable via processSwitchOff.
 	// Without this, WindowServer starts before the hook is established
@@ -625,6 +647,17 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			};
 			patcher.routeMultiple(index, requests, address, size);
 			patcher.clearError();*/
+} else if (kextSandbox.loadIndex == index) {
+		KernelPatcher::RouteRequest request {"_sb_evaluate_internal", wrapSbEvaluateInternal,
+			orgSbEvaluateInternal};
+		if (!patcher.routeMultiple(index, &request, 1, address, size))
+			patcher.clearError();
+} else if (kextAMFI.loadIndex == index) {
+		KernelPatcher::RouteRequest request {
+			"__Z30_file_check_library_validationP4procP8fileglobxxm",
+			wrapFileCheckLibraryValidation, orgFileCheckLibraryValidation};
+		if (!patcher.routeMultiple(index, &request, 1, address, size))
+			patcher.clearError();
 } else if (genx.processKext(patcher, index, address, size)) {
 	DBGLOG("ngreen", "Processed Generation x configuration");
 } else if (gen11.processKext(patcher, index, address, size)) {
@@ -635,7 +668,43 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
     return true;
 }
 
+bool NGreen::isUnderGpuBundles(void *vp) {
+	if (!callback || !callback->orgVnGetPath || !vp) return false;
+	static const char kPrefix[] = "/Library/GPUBundles";
+	char buf[1024];
+	int len = static_cast<int>(sizeof(buf));
+	int err = callback->orgVnGetPath(vp, buf, &len);
+	if (err != 0) return false;
+	for (size_t i = 0; i < sizeof(kPrefix) - 1; i++) {
+		if (buf[i] != kPrefix[i]) return false;
+	}
+	char nb = buf[sizeof(kPrefix) - 1];
+	return nb == '\0' || nb == '/';
+}
 
+uint64_t NGreen::wrapSbEvaluateInternal(void *label, uint32_t operation, void *context, void *block) {
+	uint64_t r = FunctionCast(wrapSbEvaluateInternal, callback->orgSbEvaluateInternal)(label, operation, context, block);
+	if (static_cast<uint32_t>(r) == 0 || context == nullptr) return r;
+	if (operation != 0x11 && operation != 0x16 && operation != 0x17) return r;
+	constexpr size_t kSbCtxTypeOff  = 0x0;
+	constexpr size_t kSbCtxVnodeOff = 0xC8;
+	uint32_t ctxType = *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(context) + kSbCtxTypeOff);
+	if (ctxType != 1) return r;
+	void *vp = *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(context) + kSbCtxVnodeOff);
+	if (!isUnderGpuBundles(vp)) return r;
+	return 0;
+}
+
+int NGreen::wrapFileCheckLibraryValidation(void *proc, void *fileglob, uint64_t sliceOffset,
+		uint64_t errMsg, uint64_t errMsgSize) {
+	int r = FunctionCast(wrapFileCheckLibraryValidation, callback->orgFileCheckLibraryValidation)(
+		proc, fileglob, sliceOffset, errMsg, errMsgSize);
+	if (r == 0 || fileglob == nullptr) return r;
+	if (!callback->orgFgGetVnode) return r;
+	void *vp = callback->orgFgGetVnode(fileglob);
+	if (!isUnderGpuBundles(vp)) return r;
+	return 0;
+}
 
 uint16_t NGreen::configRead16(IORegistryEntry *service, uint32_t space, uint8_t offset) {
 	if (callback && callback->orgConfigRead16) {
