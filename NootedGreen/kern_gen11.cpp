@@ -588,6 +588,33 @@ static volatile uint32_t gCtxFreeRouted = 0;
 static inline void ctxFreeLock() { if (gCtxFreeLock != nullptr) IOSimpleLockLock(gCtxFreeLock); }
 static inline void ctxFreeUnlock() { if (gCtxFreeLock != nullptr) IOSimpleLockUnlock(gCtxFreeLock); }
 
+static constexpr mach_vm_address_t kPmNotifyWrapperOff = 0x648fc;
+static const uint8_t kGtClockPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x49, 0x89, 0xc8, 0x48, 0x89, 0xd1, 0x89, 0xf2, 0x89, 0xfe};
+static volatile uint32_t gGtClockActive = 0;
+static volatile uint32_t gRp0Ratio = 0;
+static uint32_t rp0Ratio() {
+	uint32_t r = gRp0Ratio;
+	if (r != 0) return r;
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return 0;
+	r = (cb->readReg32(0x145998u) & 0xffu) * 3u;
+	if (r == 0 || r > 0x1ffu) return 0;
+	gRp0Ratio = r;
+	return r;
+}
+static void gtClockSetActive(uint32_t on) {
+	gGtClockActive = on != 0 ? 1u : 0u;
+}
+static int answerPmNotify(unsigned int cls, unsigned int busy, unsigned long long *hint, unsigned int *freq) {
+	(void)cls; (void)busy; (void)hint;
+	if (gGtClockActive == 0 || freq == nullptr) return static_cast<int>(kIOReturnUnsupported);
+	const uint32_t r = rp0Ratio();
+	if (r == 0) return static_cast<int>(kIOReturnUnsupported);
+	*freq = r << 23;
+	return 0;
+}
+static void routeGtClock(KernelPatcher &patcher, mach_vm_address_t address, size_t size);
+
 static bool setFastClearEnable(uint64_t pml4, uint64_t va, uint32_t expect) {
 	const uint64_t pa = walkPpgtt(pml4, va);
 	volatile uint32_t *p = (pa != 0 && (pa & 3ull) == 0) ? physToVirt(pa, 4) : nullptr;
@@ -1529,6 +1556,14 @@ static bool routeTGLDebugOffsets(KernelPatcher &patcher, RouteRequestPlus (&requ
 	return true;
 }
 
+static void routeGtClock(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
+	if (kPmNotifyWrapperOff + sizeof(kGtClockPrologue) > size || memcmp(reinterpret_cast<const void *>(address + kPmNotifyWrapperOff), kGtClockPrologue, sizeof(kGtClockPrologue)) != 0) return;
+	RouteRequestPlus requests[] = {{"__ZL15pmNotifyWrapperjjPyPj", answerPmNotify}};
+	static constexpr mach_vm_address_t offsets[] = {kPmNotifyWrapperOff};
+	if (!routeTGLDebugOffsets(patcher, requests, offsets, address, size)) return;
+	gtClockSetActive(1);
+}
+
 static void routeAgdcDoAttribute(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
 	if (kAgdcNubDoAttributeOff + sizeof(kAgdcNubPrologue) > size || memcmp(reinterpret_cast<const void *>(address + kAgdcNubDoAttributeOff), kAgdcNubPrologue, sizeof(kAgdcNubPrologue)) != 0) return;
 	RouteRequestPlus requests[] = {
@@ -2265,6 +2300,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 			PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
 				"ngreen", "Failed to route TGL debug controller offsets");
+			routeGtClock(patcher, address, size);
 			routeAgdcDoAttribute(patcher, address, size);
 			routeDpbResidency(patcher, address, size);
 			
@@ -11040,29 +11076,7 @@ static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs) {
 
 int Gen11::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1, unsigned long long *a2, unsigned int *freq) {
 	
-	/*struct intel_rps_freq_caps *caps;
-	
-	caps->rp0_freq *= GEN9_FREQ_SCALER;
-	caps->rp1_freq *= GEN9_FREQ_SCALER;
-	caps->min_freq *= GEN9_FREQ_SCALER;
-	
-	uint32_t mult=GEN9_FREQ_SCALER;
-	uint32_t ddcc_status = 0;
-	
-	*freq =caps->rp1_freq;
-	return 0;*/
-	
-	uint32_t cfreq = 0;
-
-	FunctionCast(wrapPmNotifyWrapper, callback->orgPmNotifyWrapper)(a0, a1, a2, &cfreq);
-	
-	if (!callback->freq_max) {
-		callback->freq_max = wrapReadRegister32(callback->framecont, GEN6_RP_STATE_CAP) & 0xFF;
-
-	}
-	
-	*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * callback->freq_max;
-	return 0;
+	return answerPmNotify(a0, a1, a2, freq);
 }
 
 bool Gen11::patchRCSCheck(mach_vm_address_t& start) {
