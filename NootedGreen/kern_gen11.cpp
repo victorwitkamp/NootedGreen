@@ -860,6 +860,98 @@ static thread_call_t     gScanoutLateCall   = nullptr;
 static volatile uint32_t gScanoutLateFires  = 0;
 static volatile uint32_t gImrFixDone    = 0;
 
+static constexpr uint32_t kPlaneCountPatchAt = 2;
+static constexpr uint32_t kPlaneCountFallbackDisp = 0x98;
+static const uint8_t kPlaneCountPre[] = {0x8b, 0x83, 0xb0, 0x00, 0x00, 0x00,
+                                   0x85, 0xc0, 0xba, 0x01, 0x00, 0x00, 0x00};
+
+static void patchPlaneCount(mach_vm_address_t address, size_t size, mach_vm_address_t getter) {
+	uint32_t disp = kPlaneCountFallbackDisp;
+	if (getter != 0) {
+		static const uint8_t kHead[] = {0x55, 0x48, 0x89, 0xe5, 0x8b, 0x87};
+		const uint8_t *g = reinterpret_cast<const uint8_t *>(getter);
+		if (memcmp(g, kHead, sizeof(kHead)) != 0 || g[10] != 0x5d || g[11] != 0xc3) return;
+		memcpy(&disp, g + 6, sizeof(disp));
+	}
+	uint8_t post[sizeof(kPlaneCountPre)];
+	memcpy(post, kPlaneCountPre, sizeof(post));
+	memcpy(post + kPlaneCountPatchAt, &disp, sizeof(disp));
+	const bool same = memcmp(post, kPlaneCountPre, sizeof(post)) == 0;
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	uint32_t n = 0, nPost = 0;
+	size_t at = 0;
+	for (size_t i = 0; i + sizeof(kPlaneCountPre) <= size; i++) {
+		if (img[i] != 0x8b) continue;
+		if (memcmp(img + i, kPlaneCountPre, sizeof(kPlaneCountPre)) == 0) { if (n++ == 0) at = i; }
+		else if (!same && memcmp(img + i, post, sizeof(post)) == 0) { if (nPost++ == 0) at = i; }
+	}
+	if (n + nPost == 0) return;
+	if (n + nPost > 1) return;
+	if (nPost == 1 || same) return;
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	memcpy(const_cast<uint8_t *>(img + at + kPlaneCountPatchAt), &disp, sizeof(disp));
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+}
+
+static constexpr uint32_t kPixelFormatPatchAt = 2;
+static constexpr uint32_t kPixelFormatFallbackDisp = 0x80;
+static const uint8_t kPixelFormatPre[] = {0x8b, 0x83, 0xa4, 0x00, 0x00, 0x00,
+                                   0x89, 0x85, 0xf4, 0xfe, 0xff, 0xff};
+
+static void patchPixelFormat(mach_vm_address_t address, size_t size, mach_vm_address_t getter) {
+	uint32_t disp = kPixelFormatFallbackDisp;
+	if (getter != 0) {
+		static const uint8_t kHead[] = {0x55, 0x48, 0x89, 0xe5, 0x8b, 0x87};
+		const uint8_t *g = reinterpret_cast<const uint8_t *>(getter);
+		if (memcmp(g, kHead, sizeof(kHead)) != 0 || g[10] != 0x5d || g[11] != 0xc3) return;
+		memcpy(&disp, g + 6, sizeof(disp));
+	}
+	uint8_t post[sizeof(kPixelFormatPre)];
+	memcpy(post, kPixelFormatPre, sizeof(post));
+	memcpy(post + kPixelFormatPatchAt, &disp, sizeof(disp));
+	const bool same = memcmp(post, kPixelFormatPre, sizeof(post)) == 0;
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	uint32_t n = 0, nPost = 0;
+	size_t at = 0;
+	for (size_t i = 0; i + sizeof(kPixelFormatPre) <= size; i++) {
+		if (img[i] != 0x8b) continue;
+		if (memcmp(img + i, kPixelFormatPre, sizeof(kPixelFormatPre)) == 0) { if (n++ == 0) at = i; }
+		else if (!same && memcmp(img + i, post, sizeof(post)) == 0) { if (nPost++ == 0) at = i; }
+	}
+	if (n + nPost == 0) return;
+	if (n + nPost > 1) return;
+	if (nPost == 1 || same) return;
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	memcpy(const_cast<uint8_t *>(img + at + kPixelFormatPatchAt), &disp, sizeof(disp));
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+}
+
+static constexpr uint32_t kValidatePixelFormatPatchAt = 2;
+static constexpr uint32_t kValidatePixelFormatDisp = 0x80;
+static const uint8_t kValidatePixelFormatPre[] = {0x8b, 0x80, 0xa4, 0x00, 0x00, 0x00,
+                                   0x89, 0x45, 0xb4,
+                                   0x48, 0x8d, 0x4d, 0x80};
+
+static void patchValidatePixelFormat(mach_vm_address_t address, size_t size) {
+	uint8_t post[sizeof(kValidatePixelFormatPre)];
+	memcpy(post, kValidatePixelFormatPre, sizeof(post));
+	memcpy(post + kValidatePixelFormatPatchAt, &kValidatePixelFormatDisp, sizeof(kValidatePixelFormatDisp));
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	uint32_t n = 0, nPost = 0;
+	size_t at = 0;
+	for (size_t i = 0; i + sizeof(kValidatePixelFormatPre) <= size; i++) {
+		if (img[i] != 0x8b) continue;
+		if (memcmp(img + i, kValidatePixelFormatPre, sizeof(kValidatePixelFormatPre)) == 0) { if (n++ == 0) at = i; }
+		else if (memcmp(img + i, post, sizeof(post)) == 0) { if (nPost++ == 0) at = i; }
+	}
+	if (n + nPost == 0) return;
+	if (n + nPost > 1) return;
+	if (nPost == 1) return;
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	memcpy(const_cast<uint8_t *>(img + at + kValidatePixelFormatPatchAt), &kValidatePixelFormatDisp, sizeof(kValidatePixelFormatDisp));
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+}
+
 static mach_vm_address_t gBlit2DSupported = 0;
 static mach_vm_address_t gBlit3DSupported = 0;
 
@@ -2605,6 +2697,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 		
 		patchEdpTranscoder(address, size);
+		patchValidatePixelFormat(address, size);
 
 		return true;
 		
@@ -3016,6 +3109,14 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		patchResolveEop(address, size);
 		patchTileFlush(address, size);
 		patchAuxFlush(address, size);
+		{
+			const mach_vm_address_t planeCount = patcher.solveSymbol(KernelPatcher::KernelID, "__ZNK9IOSurface13getPlaneCountEv");
+			if (planeCount == 0) patcher.clearError();
+			patchPlaneCount(address, size, planeCount);
+			const mach_vm_address_t pixelFormat = patcher.solveSymbol(KernelPatcher::KernelID, "__ZNK9IOSurface14getPixelFormatEv");
+			if (pixelFormat == 0) patcher.clearError();
+			patchPixelFormat(address, size, pixelFormat);
+		}
 		routeResolveInit(patcher, index, address, size);
 
 		{
