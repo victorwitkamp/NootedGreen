@@ -224,6 +224,9 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		SYSLOG("DYLD", "V50: Applied ICL Metal device-ID bypass (f2, mask-based)");
 	}
 	
+	if (IS_RAPTOR_LAKE_HX())
+		KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMTLSerializeForDonorFind,
+			arrsize(kMTLSerializeForDonorFind), kMTLSerializeForDonorRepl, arrsize(kMTLSerializeForDonorRepl));
 	KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMTLSliceIdNilArchFind,
 		arrsize(kMTLSliceIdNilArchFind), kMTLSliceIdNilArchRepl, arrsize(kMTLSliceIdNilArchRepl));
 	// Stage-3 Metal (hardcoded): assertion bypass + RunFullDisplayPipe NULL-guard

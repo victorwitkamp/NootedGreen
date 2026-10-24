@@ -130,6 +130,22 @@ static_assert(sizeof(kLibLLVMDepOriginal) == sizeof(kLibLLVMDepPatched),
 static_assert(sizeof(kLibLLVMDepOriginal) == 96,
     "libLLVM dep-path field length changed - re-derive it from the plugin binary");
 
+static const uint8_t kMTLSerializeForDonorFind[] = {
+    0x31, 0xC0,
+    0x81, 0xFA, 0x17, 0x7D, 0x00, 0x00,
+    0x0F, 0x45, 0xC2,
+    0x4C, 0x8D, 0x6D, 0xC8,
+};
+static const uint8_t kMTLSerializeForDonorRepl[] = {
+    0xB8, 0x3E, 0x0F, 0x00, 0x00,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x4C, 0x8D, 0x6D, 0xC8,
+};
+static_assert(sizeof(kMTLSerializeForDonorFind) == sizeof(kMTLSerializeForDonorRepl),
+    "MTLCompiler patch must not change the byte length");
+static_assert(sizeof(kMTLSerializeForDonorFind) == 15,
+    "MTLCompiler patch length changed - re-derive it from MTLCompiler 32023");
+
 static const uint8_t kMTLSliceIdNilArchFind[] = {
     0xFF, 0x15, 0x7A, 0x36, 0xBD, 0x32,
     0x49, 0x89, 0xC7,
