@@ -68,6 +68,41 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	}
 
     if (!UserPatcher::matchSharedCachePath(path)) {
+		if (strstr(path, kTGLMetalDriverPath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCPluginPathOriginal, arrsize(kIGCPluginPathOriginal),
+					kIGCPluginPathPatched, arrsize(kIGCPluginPathPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescVfVertexDesc1Original, arrsize(kMetalDescVfVertexDesc1Original),
+					kMetalDescVfVertexDesc1Patched, arrsize(kMetalDescVfVertexDesc1Patched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescVfVertexDesc2Original, arrsize(kMetalDescVfVertexDesc2Original),
+					kMetalDescVfVertexDesc2Patched, arrsize(kMetalDescVfVertexDesc2Patched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescSmFragmentFuncOriginal, arrsize(kMetalDescSmFragmentFuncOriginal),
+					kMetalDescSmFragmentFuncPatched, arrsize(kMetalDescSmFragmentFuncPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescWmFragmentFuncOriginal, arrsize(kMetalDescWmFragmentFuncOriginal),
+					kMetalDescWmFragmentFuncPatched, arrsize(kMetalDescWmFragmentFuncPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLClipRasterFlagFind, arrsize(kTGLMTLClipRasterFlagFind),
+					kTGLMTLClipRasterFlagRepl, arrsize(kTGLMTLClipRasterFlagRepl));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLClipGLModeFlagFind, arrsize(kTGLMTLClipGLModeFlagFind),
+					kTGLMTLClipGLModeFlagRepl, arrsize(kTGLMTLClipGLModeFlagRepl));
+			}
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLWmRasterFlagFind, arrsize(kTGLMTLWmRasterFlagFind),
+				kTGLMTLWmRasterFlagRepl, arrsize(kTGLMTLWmRasterFlagRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLWmGLModeFlagFind, arrsize(kTGLMTLWmGLModeFlagFind),
+				kTGLMTLWmGLModeFlagRepl, arrsize(kTGLMTLWmGLModeFlagRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLPoshAfterPsoFind, arrsize(kTGLMTLPoshAfterPsoFind),
+				kTGLMTLPoshAfterPsoRepl, arrsize(kTGLMTLPoshAfterPsoRepl));
+			for (const auto &fix : kTGLMTLStaleDescFixes)
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, fix.find, fix.len, fix.repl, fix.len);
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLBlitUrbFind, arrsize(kTGLMTLBlitUrbFind),
+				kTGLMTLBlitUrbRepl, arrsize(kTGLMTLBlitUrbRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLBlit3DFind, arrsize(kTGLMTLBlit3DFind),
+				kTGLMTLBlit3DRepl, arrsize(kTGLMTLBlit3DRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLNo2DFind, arrsize(kTGLMTLNo2DFind),
+				kTGLMTLNo2DRepl, arrsize(kTGLMTLNo2DRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLClearStoreFind, arrsize(kTGLMTLClearStoreFind),
+				kTGLMTLClearStoreRepl, arrsize(kTGLMTLClearStoreRepl));
+			return;
+		}
 
 		if (strstr(path, kIGCPluginBundlePath) != nullptr) {
 			if (IS_RAPTOR_LAKE_HX()) {
@@ -189,6 +224,8 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		SYSLOG("DYLD", "V50: Applied ICL Metal device-ID bypass (f2, mask-based)");
 	}
 	
+	KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMTLSliceIdNilArchFind,
+		arrsize(kMTLSliceIdNilArchFind), kMTLSliceIdNilArchRepl, arrsize(kMTLSliceIdNilArchRepl));
 	// Stage-3 Metal (hardcoded): assertion bypass + RunFullDisplayPipe NULL-guard
 	// + GetMTLTexture/CQ stubs. AccessComplete is live (not skipped).
 
