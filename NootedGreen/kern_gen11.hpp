@@ -1625,8 +1625,7 @@ private:
 	mach_vm_address_t oparamsSurfCompare {};
 
 	// V402: AppleIntelBaseController::setupDSCEngineParams(AppleIntelFramebuffer *, CRTCParams *, AppleIntelDisplayPath *, IODetailedTimingInformationV2 *)
-	// Read-only diagnostic. Linux confirms DSC=off on our panel; this hook lets us
-	// see if Apple still configures DSC despite Info.plist DSCSupport=0.
+	// Latches the DSC parameters for the VDSC flush.
 	// AppleIntelBaseController::setupDSCEngineParams(AppleIntelFramebuffer*, CRTCParams*, AppleIntelDisplayPath*, IODetailedTimingInformationV2*)
 	static void setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
 	                                 AppleIntel::AppleIntelFramebuffer *fb,
@@ -1634,6 +1633,13 @@ private:
 	                                 AppleIntel::AppleIntelDisplayPath *path,
 	                                 IODetailedTimingInformationV2 *timing);
 	mach_vm_address_t osetupDSCEngineParams {};
+
+	static void wrapEnableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
+	                                AppleIntel::AppleIntelDisplayPath *path);
+	static void wrapDisableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
+	                                 AppleIntel::AppleIntelDisplayPath *path);
+	mach_vm_address_t oEnableDSCEngine {};
+	mach_vm_address_t oDisableDSCEngine {};
 
 	// V403: AppleIntelBaseController::SetupParams(AppleIntelFramebuffer *, AppleIntelDisplayPath *, CRTCParams *, IODetailedTimingInformationV2 const *)
 	// The MASTER CRTCParams builder — runs once per modeset before any consumer.

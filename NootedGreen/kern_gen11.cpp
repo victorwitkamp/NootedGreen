@@ -153,6 +153,90 @@ IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
 	return ret;
 }
 
+static constexpr uint32_t kDssCtl1A  = 0x78000u;
+static constexpr uint32_t kDssCtl2A  = 0x78004u;
+
+static void clearVdscGatePipeOff() {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return;
+	const uint32_t conf = cb->readReg32(0x70008u);
+	const uint32_t func = cb->readReg32(0x60400u);
+	const uint32_t p1   = cb->readReg32(kDssCtl1A);
+	const uint32_t p2   = cb->readReg32(kDssCtl2A);
+	const bool pipeOff  = (conf & 0xC0000000u) == 0u && (func & 0x80000000u) == 0u;
+	const bool gateSet  = (p1 & (1u << 30)) != 0u || (p2 & ((1u << 31) | (1u << 15))) != 0u;
+	if (gateSet && pipeOff) {
+		cb->writeReg32(kDssCtl1A, 0u);
+		cb->writeReg32(kDssCtl2A, 0u);
+		cb->readReg32(kDssCtl1A);
+	}
+}
+
+static constexpr uint32_t kVdscRegs = 24, kVdscDwords = 26, kVdscPpsRegs = 12, kVdscEngine1 = 0x100;
+static constexpr size_t kVdscParamsDsc = 0x88, kVdscPathPipe = 0x3640, kVdscPathPort = 0x3648;
+static constexpr size_t kVdscPortDsc = 0x11c;
+static const uint32_t kVdscReg[kVdscRegs] = {
+	0x78070, 0x78074, 0x78078, 0x7807c, 0x78080, 0x78084, 0x78088, 0x7808c, 0x78090, 0x78094, 0x78098, 0x780b0,
+	0x78054, 0x78058, 0x7805c, 0x78060, 0x78008, 0x7800c, 0x78010, 0x78014, 0x78018, 0x7801c, 0x78020, 0x78024,
+};
+static volatile uint32_t gVdscRouted = 0, gVdscFlushed = 0;
+static volatile uint32_t gVdscLatchOn = 0;
+static uint32_t gVdscLatchDw[kVdscDwords];
+static const void *gVdscLatchPath = nullptr, *gVdscFlushPath = nullptr;
+
+static void vdscLatch(const void *params, const void *path) {
+	const uint32_t *src = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(params) + kVdscParamsDsc);
+	for (uint32_t i = 0; i < kVdscDwords; i++) gVdscLatchDw[i] = src[i];
+	const uint32_t on = (gVdscLatchDw[24] | gVdscLatchDw[25]) != 0u ? 1u : 0u;
+	gVdscLatchPath = path;
+	gVdscLatchOn = on;
+}
+
+static void vdscClearDss() {
+	auto *cb = NGreen::callback;
+	cb->writeReg32(kDssCtl1A, 0u);
+	cb->writeReg32(kDssCtl2A, 0u);
+	cb->readReg32(kDssCtl1A);
+	gVdscFlushed = 0;
+	gVdscFlushPath = nullptr;
+}
+
+static void vdscEnable(void *path) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || cb->getIsRealTGL() || path == nullptr || gVdscRouted != 3u || !cb->mmioMapped()) return;
+	void *port = getMember<void *>(path, kVdscPathPort);
+	const uint32_t pipe = getMember<uint32_t>(path, kVdscPathPipe);
+	const bool portOn = port != nullptr && getMember<uint8_t>(port, kVdscPortDsc) != 0;
+	const bool latchOn = gVdscLatchOn != 0u && gVdscLatchPath == path;
+	if (!latchOn && !portOn) {
+		if (gVdscFlushed != 0u && gVdscFlushPath == path) vdscClearDss();
+		return;
+	}
+	if (!latchOn || !portOn || pipe != 0u) return;
+	bool rcZero = true;
+	for (uint32_t i = kVdscPpsRegs; i < kVdscRegs; i++) rcZero = rcZero && gVdscLatchDw[i] == 0u;
+	for (uint32_t i = 0; i < kVdscRegs; i++) {
+		if (i >= kVdscPpsRegs && rcZero) continue;
+		for (uint32_t e = 0; e < 2u; e++) {
+			const uint32_t reg = kVdscReg[i] + e * kVdscEngine1;
+			cb->writeReg32(reg, gVdscLatchDw[i]);
+			(void)cb->readReg32(reg);
+		}
+	}
+	cb->writeReg32(kDssCtl1A, gVdscLatchDw[24]);
+	cb->writeReg32(kDssCtl2A, gVdscLatchDw[25]);
+	(void)cb->readReg32(kDssCtl1A);
+	(void)cb->readReg32(kDssCtl2A);
+	gVdscFlushPath = path;
+	gVdscFlushed = 1;
+}
+
+static void vdscDisable(void *path) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || gVdscFlushed == 0u || path != gVdscFlushPath || !cb->mmioMapped()) return;
+	vdscClearDss();
+}
+
 static constexpr uint32_t kSinkD3HoldMs = 20;
 static constexpr uint32_t kPpsCycleMs  = 500u;
 static constexpr uint32_t kPpsSettleMs = 50u;
@@ -663,8 +747,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// tiling bits (mask 0xF800000), PLANE_STRIDE (+0x18), PLANE_SURF (+0x20)
 			// for both old and new PLANEPARAMS, plus CRTCParams PIPE_SRCSZ.
 			{"__ZN24AppleIntelBaseController17paramsSurfCompareEP10CRTCParamsS1_PN15AppleIntelPlane11PLANEPARAMSES4_", paramsSurfCompare, this->oparamsSurfCompare},
-			// V402: setupDSCEngineParams — read-only. Logs entry of DSC config path.
-			// Linux says DSC=off; this hook reveals whether Apple still goes through it.
+			// V402: setupDSCEngineParams — latches the DSC parameters for the VDSC flush.
 			{"__ZN24AppleIntelBaseController20setupDSCEngineParamsEP21AppleIntelFramebufferP10CRTCParamsP21AppleIntelDisplayPathP29IODetailedTimingInformationV2", setupDSCEngineParams, this->osetupDSCEngineParams},
 			// V403: SetupParams — master CRTCParams builder. Read-only logger of all
 			// key fields after Apple populates the struct. Single chokepoint where
@@ -707,6 +790,27 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		};
 		PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
 			"ngreen", "Failed to route TGL debug common offsets batch 1");
+		}();
+
+		[&, this]() __attribute__((noinline)) {
+			static const uint8_t prologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x30, 0x48, 0xff, 0x05};
+			static constexpr mach_vm_address_t enableOffset[] = {0x31520}, disableOffset[] = {0x3172E};
+			RouteRequestPlus enableRoute[] = {
+				{"__ZN24AppleIntelBaseController15enableDSCEngineEP21AppleIntelFramebufferP21AppleIntelDisplayPath", wrapEnableDSCEngine, this->oEnableDSCEngine},
+			};
+			RouteRequestPlus disableRoute[] = {
+				{"__ZN24AppleIntelBaseController16disableDSCEngineEP21AppleIntelFramebufferP21AppleIntelDisplayPath", wrapDisableDSCEngine, this->oDisableDSCEngine},
+			};
+			const bool same = disableOffset[0] + sizeof(prologue) <= size &&
+			    memcmp(reinterpret_cast<const void *>(address + enableOffset[0]), prologue, sizeof(prologue)) == 0 &&
+			    memcmp(reinterpret_cast<const void *>(address + disableOffset[0]), prologue, sizeof(prologue)) == 0;
+			uint32_t routed = 0;
+			if (same) {
+				if (routeTGLDebugOffsets(patcher, disableRoute, disableOffset, address, size)) routed |= 2u;
+				if (routed != 0u && routeTGLDebugOffsets(patcher, enableRoute, enableOffset, address, size)) routed |= 1u;
+			}
+			patcher.clearError();
+			gVdscRouted = routed;
 		}();
 
 		[&, this]() __attribute__((noinline)) {
@@ -2107,40 +2211,35 @@ bool Gen11::paramsSurfCompare(AppleIntel::AppleIntelBaseController *that,
 	return ret;
 }
 
-// V402: AppleIntelBaseController::setupDSCEngineParams — READ-ONLY logger.
-// Logs entry of DSC config path. Linux says DSC=off on our panel; if Apple still
-// goes through this with non-zero DSC bits, the call is the origin of any DSC
-// corruption and disabling it here would replace V300's CRTCParams write-back.
+// V402: AppleIntelBaseController::setupDSCEngineParams — latches the DSC parameters for the VDSC flush.
 void Gen11::setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
                                  AppleIntel::AppleIntelFramebuffer *fb,
                                  AppleIntel::CRTCParams *params,
 								 AppleIntel::AppleIntelDisplayPath *path,
                                  IODetailedTimingInformationV2 *timing)
 {
-	// Pre-call snapshot: did anyone set DSC fields before us?
-	uint32_t pre_dsc_engine = 0, pre_dsc_joiner = 0, pre_pps0 = 0;
-	if (NGreen::callback != nullptr && !NGreen::callback->isRealTGL && params != nullptr) {
-		pre_dsc_engine = params->DSC_ENGINE_SEL;
-		pre_dsc_joiner = params->DSC_JOINER_CTL;
-		pre_pps0       = params->PPS_0;
-	}
+	if (NGreen::callback != nullptr && !NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX() && gTGLFbBase != 0)
+		*(volatile uint64_t *)(gTGLFbBase + 0x1c2b90) = 1;
 
 	FunctionCast(setupDSCEngineParams, callback->osetupDSCEngineParams)(that, fb, params, path, timing);
 
 	if (NGreen::callback == nullptr || NGreen::callback->isRealTGL || params == nullptr) return;
 
-	static int v402Count = 0;
-	if (v402Count >= 6) return;
-	++v402Count;
+	vdscLatch(params, path);
+}
 
-	const bool dsc_was_enabled = (params->DSC_ENGINE_SEL & 0xF0000000u) != 0;
-	SYSLOG("ngreen", "V402[%d]: setupDSCEngineParams %s | "
-		   "PRE: DSC_ENGINE=0x%x DSC_JOINER=0x%x PPS_0=0x%x | "
-		   "POST: DSC_ENGINE=0x%x DSC_JOINER=0x%x PPS_0=0x%x PPS_16=0x%x",
-		   v402Count,
-		   dsc_was_enabled ? "*** DSC ENABLED (vs Linux=off) ***" : "(DSC stayed off)",
-		   pre_dsc_engine, pre_dsc_joiner, pre_pps0,
-		   params->DSC_ENGINE_SEL, params->DSC_JOINER_CTL, params->PPS_0, params->PPS_16);
+void Gen11::wrapEnableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
+                                AppleIntel::AppleIntelDisplayPath *path)
+{
+	vdscEnable(path);
+	FunctionCast(wrapEnableDSCEngine, callback->oEnableDSCEngine)(that, fb, path);
+}
+
+void Gen11::wrapDisableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
+                                 AppleIntel::AppleIntelDisplayPath *path)
+{
+	FunctionCast(wrapDisableDSCEngine, callback->oDisableDSCEngine)(that, fb, path);
+	vdscDisable(path);
 }
 
 static volatile uint32_t gTransFuncCtl = 0;
@@ -2720,6 +2819,7 @@ static void fixTxDw5() {
 }
 
 IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
+	clearVdscGatePipeOff();
 	if (callback->orgICLReadAUX != 0 && gTGLFbBase != 0 && __sync_val_compare_and_swap(&gSinkPowerDone, 0u, 1u) == 0u) {
 		auto readAUX = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX);
 		auto writeAUX = reinterpret_cast<AUXFn>(gTGLFbBase + kWriteAUXOffset);
