@@ -347,6 +347,7 @@ struct PACKED intel_dmc_header_v3 {
 	(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT | CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT | CTX_CTRL_INHIBIT_SYN_CTX_SWITCH)
 #define RING_ELSP(base)				((base) + 0x230) /* ExecList Submission Port */
 #define RING_EXECLIST_STATUS(base)	((base) + 0x234)
+#define RING_EXECLIST_STATUS_HI(base) ((base) + 0x238)
 #define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3a0)
 #define RING_MODE(base)				((base) + 0x29c)
 #define RING_FAULT_REG(base)		((base) + 0x150)
@@ -381,6 +382,7 @@ struct PACKED intel_dmc_header_v3 {
 #define GGTT_PTE_HI(page)		(GEN8_GGTT_PTE_BASE + (page) * 8 + 4)
 #define   GEN11_GFX_DISABLE_LEGACY_MODE		(1 << 3)
 #define   STOP_RING				REG_BIT(8)
+#define   MODE_IDLE				REG_BIT(9)
 // Engine ring base addresses (RCS=render, BCS=blitter, VCS/BSD=video, VECS=video enhance)
 #define RENDER_RING_BASE	0x02000
 #define GEN12_COMPUTE0_RING_BASE	0x1a000
@@ -1378,6 +1380,20 @@ private:
 	mach_vm_address_t oHWCS5RegisterForInterrupts {};
 	mach_vm_address_t oIGSchedEnablePeriodic {};
 
+	static void wrapHWCS5SubmitExecList(void *that, uint32_t flags);
+	mach_vm_address_t oHWCS5SubmitExecList {};
+	static void wrapIdleToActive(void *that, const uint32_t *e);
+	static void wrapPreempted(void *that, const uint32_t *e);
+	static void wrapElementSwitch(void *that, const uint32_t *e);
+	static void wrapActiveToIdle(void *that, const uint32_t *e);
+	static void wrapResetOnWake(void *that);
+	mach_vm_address_t oIdleToActive {}, oPreempted {}, oElementSwitch {}, oActiveToIdle {}, oResetOnWake {};
+
+	static uint64_t wrapEnablePeriodic(void *sched, void *src);
+	mach_vm_address_t oEnablePeriodic {};
+	static uint64_t wrapDisablePeriodic(void *sched, void *src);
+	mach_vm_address_t oDisablePeriodic {};
+
 	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
 	static void v60GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V60: active ERROR_GEN6 suppression + monitor
 	static void v71EmrEnforcer(thread_call_param_t, thread_call_param_t);  // V71: high-freq EMR mask + ERROR clear (50ms)
@@ -2076,6 +2092,8 @@ public:
 	mach_vm_address_t oIOAF2_getBufferPtrNoInc {};
 	mach_vm_address_t oIOAF2_submitBuffer {};
 	mach_vm_address_t ResolveExtendedCtxParams {};
+	static void wrapPageon(void *that, void *event, bool flag, uint64_t opt);
+	mach_vm_address_t oPageon {};
 	static uint32_t wrapDoHangAnalysis(void *that);
 	mach_vm_address_t oDoHangAnalysis {};
 

@@ -75,6 +75,13 @@ static volatile UInt32 gIrqWatchdogPasses = 0;
 static volatile UInt32 gEmrEnforcerArmed = 0;
 static int gEmrCount = 0;
 
+static constexpr size_t   kCsOffSlot0     = 0x30;
+static constexpr size_t   kCsOffCur       = 0x50;
+static constexpr size_t   kCsOffHwsp      = 0x68;
+static constexpr size_t   kCsOffDesc      = 0x28;
+static constexpr size_t   kCsOffSwRead    = 0x1c04;
+static constexpr size_t   kCsOffGate      = 0x1c3c;
+
 static inline bool isKernelPointer(uint64_t p) {
 	return p >= 0xffffff8000000000ull && p < 0xffffffff00000000ull;
 }
@@ -151,6 +158,23 @@ static volatile uint32_t gBurstLeft = 0;
 static uint32_t gBurstPrevExec   = 0xffffffffu;
 static uint32_t gBurstPrevHead   = 0xffffffffu;
 
+static constexpr size_t kElBase     = 0x30;
+static constexpr size_t kCurIdxOff  = 0x50;
+static constexpr size_t kCtxIdOff   = 0x7c;
+static constexpr size_t kCsDescOff  = 0x28;
+static constexpr size_t kDescSqOff  = 0x19;
+static constexpr size_t kDescElcOff = 0x1d;
+
+static uint32_t streamerSq(void *cs) {
+	if (cs == nullptr) return 0;
+	auto *desc = *reinterpret_cast<uint8_t *volatile *>(static_cast<volatile uint8_t *>(cs) + kCsDescOff);
+	if (desc == nullptr) return 0;
+	const uint32_t sq = *reinterpret_cast<volatile const uint32_t *>(desc + kDescSqOff);
+	const uint32_t el = *reinterpret_cast<volatile const uint32_t *>(desc + kDescElcOff);
+	if ((sq & 0xfffu) != 0x510u || sq >= 0x400000u || el != sq + 0x40u) return 0;
+	return sq;
+}
+
 static constexpr size_t   kCtxLrcBufOff   = 0x98;
 static constexpr size_t   kSharedBufVaOff = 0x38;
 static constexpr uint32_t kPoshSlot        = 0x35 + 1;
@@ -169,13 +193,108 @@ static volatile uint32_t *lrcImageOf(void *ctx) {
 	return img;
 }
 
+static constexpr uint32_t kL3AllocReg  = 0xb134u;
+static constexpr uint32_t kAppleL3     = 0x88000020u;
+static constexpr uint32_t kMesaL3      = 0xB0000040u;
+static constexpr uint32_t kL3ScanDw      = 64;
+static constexpr uint32_t kL3RingDw      = 512;
+static constexpr uint64_t kL3AddrMask    = 0x0000FFFFFFFFF000ull;
+static uint64_t *volatile gPhysmapBase = nullptr;
+static uint64_t *volatile gPhysmapMax  = nullptr;
+
 extern volatile uint64_t gStolenLo, gStolenHi;
 extern volatile uint32_t gStolenState;
+static volatile uint32_t *physToVirt(uint64_t pa, uint32_t bytes) {
+	uint64_t *pb = gPhysmapBase, *pm = gPhysmapMax;
+	if (pb == nullptr || pm == nullptr) return nullptr;
+	const uint64_t base = *pb, max = *pm;
+	if (base == 0 || max <= base || pa < 0x1000ull || pa >= (1ull << 46)) return nullptr;
+	if ((pa & 0xfffull) + bytes > 0x1000ull) return nullptr;
+	if (gStolenState == 1 && pa < gStolenHi && pa + bytes > gStolenLo) {
+		return nullptr;
+	}
+	const uint64_t va = base + pa;
+	if (va < base || va + bytes > max) return nullptr;
+	return reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(va));
+}
 static inline void flushLines(volatile const void *p, uint32_t bytes) {
 	uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(63);
 	const uintptr_t end = reinterpret_cast<uintptr_t>(p) + bytes;
 	for (; a < end; a += 64) asm volatile("clflush (%0)" :: "r"(a) : "memory");
 	asm volatile("mfence" ::: "memory");
+}
+static bool readPhys32(uint64_t pa, uint32_t &out) {
+	volatile uint32_t *p = physToVirt(pa, 4);
+	if (p == nullptr) return false;
+	flushLines(p, 4);
+	out = *p;
+	return true;
+}
+static uint64_t pageWalk(uint64_t pml4, uint64_t va) {
+	uint64_t tbl = pml4 & kL3AddrMask;
+	if (tbl == 0) return 0;
+	const uint32_t idx[4] = {
+	    static_cast<uint32_t>((va >> 39) & 0x1ff), static_cast<uint32_t>((va >> 30) & 0x1ff),
+	    static_cast<uint32_t>((va >> 21) & 0x1ff), static_cast<uint32_t>((va >> 12) & 0x1ff)};
+	for (int lvl = 0; lvl < 4; lvl++) {
+		uint32_t lo = 0, hi = 0;
+		const uint64_t ea = tbl + static_cast<uint64_t>(idx[lvl]) * 8ull;
+		if (!readPhys32(ea, lo) || !readPhys32(ea + 4, hi)) return 0;
+		const uint64_t ent = (static_cast<uint64_t>(hi) << 32) | lo;
+		if ((ent & 1ull) == 0) return 0;
+		if (lvl == 3) return (ent & kL3AddrMask) | (va & 0xfffull);
+		if (lvl >= 1 && (ent & (1ull << 7))) {
+			if (lvl == 1) return (ent & 0x0000FFFFC0000000ull) | (va & 0x3FFFFFFFull);
+			return (ent & 0x0000FFFFFFE00000ull) | (va & 0x1FFFFFull);
+		}
+		tbl = ent & kL3AddrMask;
+	}
+	return 0;
+}
+static bool ringDw(NGreen *cb, uint32_t start, uint32_t off, uint32_t &out, uint32_t &cPage, uint64_t &cPa) {
+	const uint32_t ga = start + off;
+	const uint32_t page = ga >> 12;
+	if (page != cPage) {
+		const uint32_t lo = cb->readReg32(GGTT_PTE_LO(page));
+		const uint32_t hi = cb->readReg32(GGTT_PTE_HI(page));
+		if ((lo & 1u) == 0) return false;
+		cPa   = ((static_cast<uint64_t>(hi) << 32) | lo) & kL3AddrMask;
+		cPage = page;
+	}
+	return readPhys32(cPa | (ga & 0xfffu), out);
+}
+static void patchL3Batch(uint64_t pml4, uint64_t bva) {
+	const uint64_t pa = pageWalk(pml4, bva);
+	if (pa == 0) return;
+	uint32_t n = static_cast<uint32_t>((0x1000ull - (pa & 0xfffull)) / 4ull);
+	if (n > kL3ScanDw) n = kL3ScanDw;
+	volatile uint32_t *p = physToVirt(pa, n * 4u);
+	if (p == nullptr) return;
+	flushLines(p, n * 4u);
+	for (uint32_t i = 0; i + 2 < n; i++) {
+		if (p[i] != 0x11000001u || p[i + 1] != kL3AllocReg) continue;
+		const uint32_t was = p[i + 2];
+		if (was == kAppleL3) {
+			p[i + 2] = kMesaL3;
+			flushLines(&p[i + 2], 4);
+		}
+		return;
+	}
+}
+
+static constexpr uint32_t kBatchEnd = 0x05000000u;
+static uint32_t cmdLen(uint32_t dw) {
+	const uint32_t type = dw >> 29;
+	if (type == 0) {
+		const uint32_t op = (dw >> 23) & 0x3fu;
+		return op < 0x10u ? 1u : (dw & 0xffu) + 2u;
+	}
+	if (type == 3) {
+		const uint32_t sub = (dw >> 27) & 3u, opc = (dw >> 24) & 7u;
+		if (sub == 1 && opc <= 1) return 1u;
+		return (dw & 0xffu) + 2u;
+	}
+	return 0;
 }
 
 static constexpr uint32_t kPoshBit  = 0x00000010u;
@@ -416,11 +535,190 @@ static void armAuxFlushBit(void *accel) {
 	if (gAuxFlushPatched) __sync_fetch_and_or(bits, 1ull);
 }
 
+static bool readPpgtt64(uint64_t pa, uint64_t &out) {
+	volatile uint32_t *p = physToVirt(pa, 8);
+	if (p == nullptr) return false;
+	out = (static_cast<uint64_t>(p[1]) << 32) | p[0];
+	return true;
+}
+static uint64_t walkPpgtt(uint64_t pml4, uint64_t va) {
+	uint64_t tbl = pml4 & kL3AddrMask;
+	if (tbl == 0) return 0;
+	const uint32_t idx[4] = {
+	    static_cast<uint32_t>((va >> 39) & 0x1ff), static_cast<uint32_t>((va >> 30) & 0x1ff),
+	    static_cast<uint32_t>((va >> 21) & 0x1ff), static_cast<uint32_t>((va >> 12) & 0x1ff)};
+	for (int lvl = 0; lvl < 4; lvl++) {
+		uint64_t ent = 0;
+		if (!readPpgtt64(tbl + static_cast<uint64_t>(idx[lvl]) * 8ull, ent)) return 0;
+		if ((ent & 1ull) == 0) return 0;
+		if (lvl == 3) return (ent & kL3AddrMask) | (va & 0xfffull);
+		if (lvl >= 1 && (ent & (1ull << 7))) {
+			if (lvl == 1) return (ent & 0x0000FFFFC0000000ull) | (va & 0x3FFFFFFFull);
+			return (ent & 0x0000FFFFFFE00000ull) | (va & 0x1FFFFFull);
+		}
+		tbl = ent & kL3AddrMask;
+	}
+	return 0;
+}
+static uint32_t readPpgtt(uint64_t pml4, uint64_t va, uint32_t n, uint32_t *out) {
+	uint32_t got = 0;
+	while (got < n) {
+		const uint64_t pa = walkPpgtt(pml4, va + static_cast<uint64_t>(got) * 4ull);
+		if (pa == 0) break;
+		uint32_t take = static_cast<uint32_t>((0x1000ull - (pa & 0xfffull)) / 4ull);
+		if (take > n - got) take = n - got;
+		volatile uint32_t *p = physToVirt(pa, take * 4u);
+		if (p == nullptr) break;
+		for (uint32_t k = 0; k < take; k++) out[got + k] = p[k];
+		got += take;
+	}
+	return got;
+}
+
+static constexpr uint32_t kTimerSlots = 16;
+struct TimerSource { void *src; int32_t net; uint32_t en, dis, skip; };
+static TimerSource gTimerSources[kTimerSlots];
+static IOSimpleLock *gTimerLock = nullptr;
 static IOSimpleLock *gCtxFreeLock = nullptr;
 static volatile uint32_t gCtxFreeRouted = 0;
 
 static inline void ctxFreeLock() { if (gCtxFreeLock != nullptr) IOSimpleLockLock(gCtxFreeLock); }
 static inline void ctxFreeUnlock() { if (gCtxFreeLock != nullptr) IOSimpleLockUnlock(gCtxFreeLock); }
+
+static bool setFastClearEnable(uint64_t pml4, uint64_t va, uint32_t expect) {
+	const uint64_t pa = walkPpgtt(pml4, va);
+	volatile uint32_t *p = (pa != 0 && (pa & 3ull) == 0) ? physToVirt(pa, 4) : nullptr;
+	if (p == nullptr) return false;
+	flushLines(p, 4);
+	const uint32_t cur = *p;
+	if (cur != expect) return false;
+	*p = cur | 0x100u;
+	flushLines(p, 4);
+	return *p == (cur | 0x100u);
+}
+
+static constexpr uint32_t kResolveMaxDw = 1024;
+static void setScopedFastClear(uint64_t pml4, uint64_t bva) {
+	uint32_t w[16];
+	if (readPpgtt(pml4, bva & ~3ull, 8, w) < 8) return;
+	if (w[0] != 0x7a000004u || w[6] != 0x69041310u) return;
+	uint64_t ssb = 0;
+	uint32_t btp = 0, dw6 = 0, off = 0, psOff = 0;
+	bool ssbSet = false, btpSet = false, ps = false, ended = false;
+	while (off < kResolveMaxDw) {
+		const uint32_t got = readPpgtt(pml4, (bva & ~3ull) + off * 4ull, 16, w);
+		if (got == 0) break;
+		const uint32_t dw = w[0];
+		if (dw == kBatchEnd) { ended = true; break; }
+		if (dw == 0) { off++; continue; }
+		const uint32_t len = cmdLen(dw);
+		if (len == 0) break;
+		const uint32_t op = dw >> 16;
+		if (op == 0x6101u && len >= 22 && got >= 6 && (w[4] & 1u)) {
+			ssb = ((static_cast<uint64_t>(w[5] & 0xffffu) << 32) | w[4]) & ~0xfffull;
+			ssbSet = true;
+		} else if (op == 0x782au && got >= 2) {
+			btp = w[1] & 0xffe0u;
+			btpSet = true;
+		} else if (op == 0x7820u && len >= 12 && got >= 12 && w[1] == 0 && w[2] == 0 && ((w[6] >> 6) & 3u) != 0) {
+			ps = true;
+			dw6 = w[6];
+			psOff = off;
+		}
+		off += len;
+	}
+	if (!ended || !ps || ((dw6 >> 6) & 3u) != 2u || (dw6 & 0x100u) != 0 || !ssbSet || !btpSet) return;
+	uint32_t bt0 = 0, s[16];
+	if (readPpgtt(pml4, ssb + btp, 1, &bt0) != 1 || bt0 == 0) return;
+	if (readPpgtt(pml4, ssb + (bt0 & ~0x3fu), 16, s) != 16) return;
+	const uint64_t surf = ((static_cast<uint64_t>(s[9] & 0xffffu) << 32) | s[8]) & 0x0000fffffffff000ull;
+	if ((s[6] & 7u) != 5u || surf == 0) return;
+	setFastClearEnable(pml4, (bva & ~3ull) + (psOff + 6u) * 4ull, dw6);
+}
+
+static void patchPendingBatches(void *cs) {
+	auto *cb = NGreen::callback;
+	if (cs == nullptr || cb == nullptr || !cb->mmioMapped()) return;
+	if (streamerSq(cs) != RENDER_RING_BASE + 0x510) return;
+	if (gPhysmapBase == nullptr || gPhysmapMax == nullptr) return;
+	auto *p = static_cast<volatile uint8_t *>(cs);
+	const uint32_t cur = *reinterpret_cast<volatile const uint32_t *>(p + kCurIdxOff);
+	if (cur > 1) return;
+	const uint32_t pend = 1u - cur;
+	for (uint32_t e = 0; e < 2; e++) {
+		void *item = *reinterpret_cast<void *volatile *>(p + kElBase + pend * 16 + e * 8);
+		void *ctx  = item ? *static_cast<void *volatile *>(item) : nullptr;
+		volatile uint32_t *img = lrcImageOf(ctx);
+		if (img == nullptr) continue;
+		const uint32_t start = img[CTX_RING_START] & 0xFFFFF000u;
+		const uint32_t ctl   = img[CTX_RING_CTL];
+		const uint64_t pml4  = (static_cast<uint64_t>(img[CTX_PDP0_UDW]) << 32) | img[CTX_PDP0_LDW];
+		if (start == 0 || (ctl & 1u) == 0 || (pml4 & kL3AddrMask) == 0) continue;
+		const uint32_t size = (((ctl >> 12) & 0x1ffu) + 1u) << 12;
+		uint32_t off = img[CTX_RING_HEAD] & (size - 1u) & ~3u;
+		uint32_t cPage = 0xffffffffu;
+		uint64_t cPa = 0;
+		for (uint32_t k = 0; k < kL3RingDw; k++) {
+			uint32_t dw = 0;
+			if (!ringDw(cb, start, off, dw, cPage, cPa)) break;
+			if (dw == 0x11000001u) {
+				uint32_t reg = 0, val = 0;
+				if (ringDw(cb, start, (off + 4u) & (size - 1u), reg, cPage, cPa) && ringDw(cb, start, (off + 8u) & (size - 1u), val, cPage, cPa) && reg == 0x4208u && val == 1u) {
+					off = (off + 12u) & (size - 1u);
+					k += 2;
+					continue;
+				}
+			}
+			if ((dw & 0xFF8001FFu) == 0x18800101u) {
+				uint32_t lo = 0, hi = 0;
+				if (ringDw(cb, start, (off + 4u) & (size - 1u), lo, cPage, cPa) && ringDw(cb, start, (off + 8u) & (size - 1u), hi, cPage, cPa)) {
+					const uint64_t bva = (static_cast<uint64_t>(hi & 0xffffu) << 32) | (lo & ~3u);
+					patchL3Batch(pml4, bva);
+					setScopedFastClear(pml4, bva);
+				}
+				off = (off + 12u) & (size - 1u);
+				k += 2;
+				continue;
+			}
+			if ((dw & 0xFF8001FFu) == 0x18800001u) {
+				off = (off + 12u) & (size - 1u);
+				k += 2;
+				continue;
+			}
+			off = (off + 4u) & (size - 1u);
+		}
+	}
+}
+
+static constexpr uint32_t kResubmitHoldMaxUs = 3000;
+static void holdResubmitIfCompleting(void *cs) {
+	auto *cb = NGreen::callback;
+	if (cs == nullptr || cb == nullptr || !cb->mmioMapped()) return;
+	if (streamerSq(cs) != RENDER_RING_BASE + 0x510) return;
+	auto *p = static_cast<volatile uint8_t *>(cs);
+	const uint32_t cur = *reinterpret_cast<volatile const uint32_t *>(p + kCurIdxOff);
+	if (cur > 1) return;
+	void *item = *reinterpret_cast<void *volatile *>(p + kElBase + (1u - cur) * 16);
+	void *ctx  = item ? *static_cast<void *volatile *>(item) : nullptr;
+	if (ctx == nullptr) return;
+	const uint32_t pendId = *reinterpret_cast<volatile const uint32_t *>(static_cast<volatile uint8_t *>(ctx) + kCtxIdOff) & 0x7ffu;
+	const uint32_t exLo0 = cb->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
+	const uint32_t exHi0 = cb->readReg32(RING_EXECLIST_STATUS_HI(RENDER_RING_BASE));
+	const uint32_t head0 = cb->readReg32(RING_HEAD(RENDER_RING_BASE));
+	const uint32_t tail0 = cb->readReg32(RING_TAIL(RENDER_RING_BASE));
+	const uint32_t csp0  = cb->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
+	const uint32_t curId = (exHi0 >> 5) & 0x7ffu;
+	const bool active    = (exLo0 & 0x18u) != 0;
+	const bool drained   = head0 == tail0 && head0 != 0;
+	if (!(active && drained && curId == pendId)) return;
+	for (uint32_t waited = 0; waited < kResubmitHoldMaxUs; waited += 10) {
+		IODelay(10);
+		const uint32_t csp  = cb->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
+		const uint32_t exLo = cb->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
+		const uint32_t mi   = cb->readReg32(RING_MI_MODE(RENDER_RING_BASE));
+		if ((csp & 0xfu) != (csp0 & 0xfu) || (exLo & 0x18u) == 0 || (mi & MODE_IDLE) != 0) break;
+	}
+}
 
 volatile uint64_t gStolenLo = 0, gStolenHi = 0;
 volatile uint32_t gStolenState = 0;
@@ -535,6 +833,19 @@ static volatile uint32_t gImrFixDone    = 0;
 static mach_vm_address_t gBlit2DSupported = 0;
 static mach_vm_address_t gBlit3DSupported = 0;
 
+static constexpr uint32_t kPageonSlotTestEvent = 0x190, kPageonStepUs = 5, kPageonMaxUs = 30000, kPageonAutoOffRun = 8;
+enum : uint32_t { kPageonNotRouted = 0, kPageonRouted, kPageonRouteFailed };
+static mach_vm_address_t gEventMachineVtbl = 0;
+static volatile uint32_t gPageonState = kPageonNotRouted, gPageonActive = 0, gPageonAutoOff = 0;
+static volatile uint32_t gPageonTimeoutRun = 0;
+
+static void pageonOnWake() {
+	if (gPageonState != kPageonRouted) return;
+	if (!__sync_bool_compare_and_swap(&gPageonAutoOff, 1u, 0u)) return;
+	gPageonTimeoutRun = 0;
+	gPageonActive = 1u;
+}
+
 static void *blit3dInitBefore(void *ctx) {
 	auto *cb = Gen11::callback;
 	auto *pool = ctx ? getMember<uint8_t *>(ctx, 0xe0) : nullptr;
@@ -631,6 +942,45 @@ static bool barrierWants() {
 }
 static void barrierHangSeen() {
 	gBarrierArmed = 0;
+}
+
+static volatile uint32_t gCsbT1Uses = 0;
+static constexpr uint32_t kCsbT1Cap = 32;
+
+static inline uint64_t csbElement(const uint8_t *cs, uint32_t slot, uint32_t el) {
+	return *reinterpret_cast<const uint64_t *>(cs + kCsOffSlot0 + 16u * slot + 8u * el);
+}
+static inline uint32_t csbContextId(uint64_t wi) {
+	if (wi == 0) return 0xffffffffu;
+	const uint8_t *ctx = *reinterpret_cast<const uint8_t *const *>(wi);
+	return ctx != nullptr ? *reinterpret_cast<const uint32_t *>(ctx + kCtxIdOff) : 0xfffffffeu;
+}
+static bool csbRawEntry(const uint8_t *cs, uint32_t &lo, uint32_t &hi, uint32_t &ptr) {
+	lo = hi = ptr = 0;
+	const uint8_t *accel = *reinterpret_cast<const uint8_t *const *>(cs + 0x10);
+	const uint8_t *desc = *reinterpret_cast<const uint8_t *const *>(cs + kCsOffDesc);
+	const uint32_t rd = *reinterpret_cast<const uint32_t *>(cs + kCsOffSwRead);
+	if (accel == nullptr || desc == nullptr || rd > 5u) return false;
+	if (*reinterpret_cast<const int8_t *>(accel + 0x1190) < 0) {
+		const uint8_t *mmio = *reinterpret_cast<const uint8_t *const *>(accel + 0x1240);
+		uint32_t bank = 0, reg = 0;
+		memcpy(&bank, desc + 0x29, sizeof(bank));
+		memcpy(&reg, desc + 0x25, sizeof(reg));
+		if (mmio == nullptr || bank < 0x2000u || bank > 0x1ffff0u || reg < 0x2000u || reg > 0x1ffff0u) return false;
+		lo = *reinterpret_cast<const volatile uint32_t *>(mmio + bank + rd * 8u);
+		hi = *reinterpret_cast<const volatile uint32_t *>(mmio + bank + rd * 8u + 4u);
+		ptr = *reinterpret_cast<const volatile uint32_t *>(mmio + reg);
+	} else {
+		const uint8_t *hwsp = *reinterpret_cast<const uint8_t *const *>(cs + kCsOffHwsp);
+		if (hwsp == nullptr) return false;
+		lo = *reinterpret_cast<const volatile uint32_t *>(hwsp + 0x40u + rd * 8u);
+		hi = *reinterpret_cast<const volatile uint32_t *>(hwsp + 0x40u + rd * 8u + 4u);
+		ptr = *reinterpret_cast<const volatile uint32_t *>(hwsp + 0xbcu);
+	}
+	return true;
+}
+static inline bool csbT1Room() {
+	return gCsbT1Uses < kCsbT1Cap;
 }
 
 static const uint32_t kClearColorSrgb8[255] = {
@@ -791,6 +1141,34 @@ static void fillClearColor(const void *cmd, const void *desc, const void *heaps)
 		s[7] = px[0];
 		s[8] = px[1];
 		return;
+	}
+}
+
+static void waitPageon(void *that, void *event) {
+	if (event == nullptr) return;
+	auto *accel = getMember<uint8_t *>(that, 0x18);
+	if (accel == nullptr) return;
+	auto *em = getMember<uint8_t *>(accel, 0x380);
+	if (em == nullptr) return;
+	const auto vptr = getMember<mach_vm_address_t>(em, 0);
+	if (gEventMachineVtbl == 0 || vptr != gEventMachineVtbl + 0x10) return;
+	const auto slot = *reinterpret_cast<const mach_vm_address_t *>(vptr + kPageonSlotTestEvent);
+	if (slot == 0) return;
+	auto test = reinterpret_cast<bool (*)(void *, void *)>(slot);
+	if (test(em, event)) return;
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(kPageonMaxUs, kMicrosecondScale, &deadline);
+	bool done = false;
+	for (;;) {
+		IODelay(kPageonStepUs);
+		if (test(em, event)) { done = true; break; }
+		if (mach_absolute_time() >= deadline) break;
+	}
+	if (done) {
+		gPageonTimeoutRun = 0;
+	} else if (__sync_add_and_fetch(&gPageonTimeoutRun, 1u) >= kPageonAutoOffRun) {
+		gPageonActive = 0;
+		gPageonAutoOff = 1;
 	}
 }
 
@@ -2266,6 +2644,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			if (pb == 0) patcher.clearError();
 			auto pm = patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max");
 			if (pm == 0) patcher.clearError();
+			gPhysmapBase = reinterpret_cast<uint64_t *>(pb);
+			gPhysmapMax  = reinterpret_cast<uint64_t *>(pm);
 		}
 
 		{
@@ -2281,6 +2661,57 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 			if (!RouteRequestPlus::routeAll(patcher, index, finishTimerRoute, address, size)) {
 				patcher.clearError();
+			}
+		}
+
+		{
+			RouteRequestPlus submitRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer514submitExecListEj",
+				 wrapHWCS5SubmitExecList, this->oHWCS5SubmitExecList},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, submitRoute, address, size)) {
+				patcher.clearError();
+			}
+		}
+
+		{
+			RouteRequestPlus i2aRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer522csbProcessIdleToActiveEPK28SGfxContextStatusBufferEntry",
+				 wrapIdleToActive, this->oIdleToActive},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, i2aRoute, address, size)) patcher.clearError();
+			RouteRequestPlus preRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer519csbProcessPreemptedEPK28SGfxContextStatusBufferEntry",
+				 wrapPreempted, this->oPreempted},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, preRoute, address, size)) patcher.clearError();
+			RouteRequestPlus esRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer523csbProcessElementSwitchEPK28SGfxContextStatusBufferEntry",
+				 wrapElementSwitch, this->oElementSwitch},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, esRoute, address, size)) patcher.clearError();
+			RouteRequestPlus a2iRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer522csbProcessActiveToIdleEPK28SGfxContextStatusBufferEntry",
+				 wrapActiveToIdle, this->oActiveToIdle},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, a2iRoute, address, size)) patcher.clearError();
+			RouteRequestPlus wakeRoute[] = {
+				{"__ZN26IGHardwareCommandStreamer511resetOnWakeEv", wrapResetOnWake, this->oResetOnWake},
+			};
+			if (!RouteRequestPlus::routeAll(patcher, index, wakeRoute, address, size)) patcher.clearError();
+		}
+
+		{
+			if (gTimerLock == nullptr) gTimerLock = IOSimpleLockAlloc();
+			struct { const char *sym; mach_vm_address_t wrap; mach_vm_address_t &org; } timerRoutes[] = {
+				{"__ZN11IGScheduler33enablePeriodicEventTimerInterruptEP22IOInterruptEventSource",
+				 reinterpret_cast<mach_vm_address_t>(wrapEnablePeriodic), this->oEnablePeriodic},
+				{"__ZN11IGScheduler34disablePeriodicEventTimerInterruptEP22IOInterruptEventSource",
+				 reinterpret_cast<mach_vm_address_t>(wrapDisablePeriodic), this->oDisablePeriodic},
+			};
+			for (auto &e : timerRoutes) {
+				RouteRequestPlus one[] = {{e.sym, e.wrap, e.org}};
+				if (gTimerLock == nullptr || !RouteRequestPlus::routeAll(patcher, index, one, address, size)) patcher.clearError();
 			}
 		}
 
@@ -2406,6 +2837,23 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 		}();
+		{
+			SolveRequestPlus pageonSyms[] = {{"__ZTV19IGAccelEventMachine", gEventMachineVtbl}};
+			if (!SolveRequestPlus::solveAll(patcher, index, pageonSyms, address, size)) {
+				patcher.clearError();
+				gEventMachineVtbl = 0;
+			}
+			RouteRequestPlus routePageon[] = {
+				{"__ZN15IGAccelResource6pageonEP12IOAccelEventby", wrapPageon, this->oPageon},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, routePageon, address, size)) {
+				gPageonState = kPageonRouted;
+				gPageonActive = 1u;
+			} else {
+				patcher.clearError();
+				gPageonState = kPageonRouteFailed;
+			}
+		}
 		{
 			if (gCtxFreeLock == nullptr) gCtxFreeLock = IOSimpleLockAlloc();
 			RouteRequestPlus ctxFreeRoute[] = {
@@ -8372,6 +8820,13 @@ void * Gen11::getColorResolveContext(void *that,bool param_1)
 	return ctx;
 }
 
+void Gen11::wrapPageon(void *that, void *event, bool flag, uint64_t opt) {
+	using Pageon = void (*)(void *, void *, bool, uint64_t);
+	reinterpret_cast<Pageon>(callback->oPageon)(that, event, flag, opt);
+	if (gPageonActive == 0 || that == nullptr) return;
+	waitPageon(that, event);
+}
+
 uint32_t Gen11::wrapDoHangAnalysis(void *that)
 {
 	barrierHangSeen();
@@ -10189,6 +10644,127 @@ void Gen11::wrapHWCS5RegisterForInterrupts(void *that) {
 
 	using EnableFn = void (*)(void *, void *);
 	reinterpret_cast<EnableFn>(callback->oIGSchedEnablePeriodic)(sched, src);
+}
+
+void Gen11::wrapIdleToActive(void *that, const uint32_t *e) {
+	auto *cs = static_cast<uint8_t *>(that);
+	const uint32_t cur = *reinterpret_cast<const uint32_t *>(cs + kCsOffCur) & 1u;
+	if (csbElement(cs, 1u - cur, 0) == 0) {
+		volatile uint8_t *gate = cs + kCsOffGate;
+		if (*gate == 0) *gate = 1;
+		return;
+	}
+	FunctionCast(wrapIdleToActive, callback->oIdleToActive)(that, e);
+}
+
+void Gen11::wrapPreempted(void *that, const uint32_t *e) {
+	auto *cs = static_cast<uint8_t *>(that);
+	if (e != nullptr) {
+		const uint32_t cur = *reinterpret_cast<const uint32_t *>(cs + kCsOffCur) & 1u;
+		const uint64_t cur0 = csbElement(cs, cur, 0), pend0 = csbElement(cs, 1u - cur, 0);
+		if (cur0 == 0 || pend0 == 0) {
+			uint32_t lo = 0, hi = 0, ptr = 0;
+			const bool ok = csbRawEntry(cs, lo, hi, ptr);
+			const bool newq = ok ? (lo & 1u) != 0 : (e[0] & 0x1f0u) != 0;
+			if (pend0 == 0 && newq) {
+				return;
+			}
+			if (cur0 == 0 && csbT1Room()) {
+				__sync_fetch_and_add(&gCsbT1Uses, 1u);
+				if (ok && pend0 != 0 && callback->oIdleToActive != 0 && csbContextId(pend0) == ((lo >> 15) & 0x7ffu))
+					FunctionCast(wrapIdleToActive, callback->oIdleToActive)(that, e);
+				return;
+			}
+		}
+	}
+	FunctionCast(wrapPreempted, callback->oPreempted)(that, e);
+}
+
+void Gen11::wrapElementSwitch(void *that, const uint32_t *e) {
+	auto *cs = static_cast<uint8_t *>(that);
+	if (e != nullptr) {
+		const uint32_t cur = *reinterpret_cast<const uint32_t *>(cs + kCsOffCur) & 1u;
+		const uint64_t cur0 = csbElement(cs, cur, 0);
+		if (cur0 == 0) {
+			if (csbT1Room()) {
+				const uint64_t pend0 = csbElement(cs, 1u - cur, 0), pend1 = csbElement(cs, 1u - cur, 1);
+				__sync_fetch_and_add(&gCsbT1Uses, 1u);
+				if (pend0 != 0 && pend1 != 0 && callback->oIdleToActive != 0 && csbContextId(pend0) == ((e[1] >> 5) & 0x7ffu)) {
+					FunctionCast(wrapIdleToActive, callback->oIdleToActive)(that, e);
+					FunctionCast(wrapElementSwitch, callback->oElementSwitch)(that, e);
+				}
+				return;
+			}
+		} else if (csbElement(cs, cur, 1) == 0) {
+			return;
+		}
+	}
+	FunctionCast(wrapElementSwitch, callback->oElementSwitch)(that, e);
+}
+
+void Gen11::wrapActiveToIdle(void *that, const uint32_t *e) {
+	auto *cs = static_cast<uint8_t *>(that);
+	if (e != nullptr) {
+		const uint32_t cur = *reinterpret_cast<const uint32_t *>(cs + kCsOffCur) & 1u;
+		if (csbElement(cs, cur, 0) == 0 && csbT1Room()) {
+			const uint64_t pend0 = csbElement(cs, 1u - cur, 0);
+			__sync_fetch_and_add(&gCsbT1Uses, 1u);
+			if (pend0 != 0 && callback->oIdleToActive != 0 && csbContextId(pend0) == ((e[1] >> 5) & 0x7ffu)) {
+				FunctionCast(wrapIdleToActive, callback->oIdleToActive)(that, e);
+				FunctionCast(wrapActiveToIdle, callback->oActiveToIdle)(that, e);
+			}
+			return;
+		}
+	}
+	FunctionCast(wrapActiveToIdle, callback->oActiveToIdle)(that, e);
+}
+
+void Gen11::wrapResetOnWake(void *that) {
+	FunctionCast(wrapResetOnWake, callback->oResetOnWake)(that);
+	pageonOnWake();
+}
+
+void Gen11::wrapHWCS5SubmitExecList(void *that, uint32_t flags) {
+	if (gRcsSubmitCs == nullptr) gRcsSubmitCs = that;
+	holdResubmitIfCompleting(that);
+	patchPendingBatches(that);
+	FunctionCast(wrapHWCS5SubmitExecList, callback->oHWCS5SubmitExecList)(that, flags);
+}
+
+static TimerSource *timerSlot(void *src, bool create) {
+	TimerSource *empty = nullptr;
+	for (uint32_t i = 0; i < kTimerSlots; i++) {
+		if (gTimerSources[i].src == src) return &gTimerSources[i];
+		if (empty == nullptr && gTimerSources[i].src == nullptr) empty = &gTimerSources[i];
+	}
+	if (!create || empty == nullptr) return nullptr;
+	*empty = TimerSource {src, 0, 0, 0, 0};
+	return empty;
+}
+
+uint64_t Gen11::wrapEnablePeriodic(void *sched, void *src) {
+	if (gTimerLock != nullptr) {
+		const IOInterruptState is = IOSimpleLockLockDisableInterrupt(gTimerLock);
+		TimerSource *e = timerSlot(src, true);
+		if (e != nullptr) e->net++;
+		IOSimpleLockUnlockEnableInterrupt(gTimerLock, is);
+	}
+	return FunctionCast(wrapEnablePeriodic, callback->oEnablePeriodic)(sched, src);
+}
+
+uint64_t Gen11::wrapDisablePeriodic(void *sched, void *src) {
+	bool unmatched = false;
+	if (gTimerLock != nullptr) {
+		const IOInterruptState is = IOSimpleLockLockDisableInterrupt(gTimerLock);
+		TimerSource *e = timerSlot(src, true);
+		if (e != nullptr) {
+			if (e->net <= 0) unmatched = true;
+			else e->net--;
+		}
+		IOSimpleLockUnlockEnableInterrupt(gTimerLock, is);
+	}
+	if (unmatched) return 0;
+	return FunctionCast(wrapDisablePeriodic, callback->oDisablePeriodic)(sched, src);
 }
 
 // V54: IRQ watchdog — re-enables Master IRQ if the driver disables it during init.
