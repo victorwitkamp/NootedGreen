@@ -1371,6 +1371,9 @@ private:
 	// ── Accelerator start & forcewake ──
 	static unsigned long start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
 
+	static void engineProbeTick(thread_call_param_t, thread_call_param_t);
+	static void armEngineProbe(void *accel);
+
 	static void wrapHWCS5RegisterForInterrupts(void *that);
 	mach_vm_address_t oHWCS5RegisterForInterrupts {};
 	mach_vm_address_t oIGSchedEnablePeriodic {};
@@ -2009,6 +2012,8 @@ private:
 	static bool stopGraphicsEngine(void *that);    // V505: dump ring preamble before ring is stopped
 	mach_vm_address_t ostopGraphicsEngine {};
 
+	void routeResolveInit(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) __attribute__((noinline));
+
 	static unsigned long startGraphicsEngine(void *that);  // V163: clear PERCTX_PREEMPT_CTRL before first context snapshot
 	mach_vm_address_t ostartGraphicsEngine {};
 
@@ -2068,6 +2073,7 @@ public:
 	// Resolved from IOAcceleratorFamily2 by NGreen::processKext — needed by blit3d scratch init.
 	mach_vm_address_t oIOAF2_lockForCPUAccess {};
 	mach_vm_address_t oIOAF2_unlockForCPUAccess {};
+	mach_vm_address_t oIOAF2_getBufferPtrNoInc {};
 	mach_vm_address_t oIOAF2_submitBuffer {};
 	mach_vm_address_t ResolveExtendedCtxParams {};
 	static uint32_t wrapDoHangAnalysis(void *that);

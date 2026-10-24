@@ -10,6 +10,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
+#include <i386/proc_reg.h>
 #include <kern/thread_call.h>
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
@@ -145,6 +146,10 @@ static void copyScratchUngated(void *mappedBuf, mach_vm_address_t origScratchIni
 	if (!isKernelPointer(mem) || origScratchInit == 0) return;
 	reinterpret_cast<void (*)(void *)>(origScratchInit)(reinterpret_cast<void *>(mem));
 }
+
+static volatile uint32_t gBurstLeft = 0;
+static uint32_t gBurstPrevExec   = 0xffffffffu;
+static uint32_t gBurstPrevHead   = 0xffffffffu;
 
 static constexpr size_t   kCtxLrcBufOff   = 0x98;
 static constexpr size_t   kSharedBufVaOff = 0x38;
@@ -282,6 +287,135 @@ static void patchDsbSize(mach_vm_address_t address, size_t size) {
 	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
 }
 
+static constexpr uint32_t kResolveEopPatchAt = 10, kResolveEopPatchLen = 8;
+static const uint8_t kResolveEopPre[] = {0x4c, 0x8b, 0xa5, 0xb8, 0xfe, 0xff, 0xff,
+                                   0x45, 0x89, 0xe5,
+                                   0x41, 0xc1, 0xed, 0x02, 0x49, 0xc1, 0xe5, 0x02,
+                                   0x49, 0xc1, 0xec, 0x20,
+                                   0x48, 0xb8, 0x04, 0x00, 0x00, 0x7a, 0x04, 0x14, 0x10, 0x00};
+static const uint8_t kResolveEopPost[kResolveEopPatchLen] = {0x41, 0x81, 0xc5, 0x00, 0x4f, 0x00, 0x00, 0x90};
+
+static void patchResolveEop(mach_vm_address_t address, size_t size) {
+	uint8_t post[sizeof(kResolveEopPre)];
+	memcpy(post, kResolveEopPre, sizeof(post));
+	memcpy(post + kResolveEopPatchAt, kResolveEopPost, kResolveEopPatchLen);
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	uint32_t n = 0, nPost = 0;
+	size_t at = 0;
+	for (size_t i = 0; i + sizeof(kResolveEopPre) <= size; i++) {
+		if (img[i] != 0x4c) continue;
+		if (memcmp(img + i, kResolveEopPre, sizeof(kResolveEopPre)) == 0) { if (n++ == 0) at = i; }
+		else if (memcmp(img + i, post, sizeof(post)) == 0) { if (nPost++ == 0) at = i; }
+	}
+	if (n + nPost == 0) return;
+	if (n + nPost > 1) return;
+	if (nPost == 1) return;
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	memcpy(const_cast<uint8_t *>(img + at + kResolveEopPatchAt), kResolveEopPost, kResolveEopPatchLen);
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+}
+
+static const uint8_t kTileFlushPre[] = {0x48, 0xb8, 0x04, 0x00, 0x00, 0x7a, 0x00, 0x50, 0x10, 0x00};
+static constexpr uint32_t kTileFlushPatchAt = 9;
+static constexpr uint8_t kTileFlushPost = 0x10;
+
+static void patchTileFlush(mach_vm_address_t address, size_t size) {
+	uint8_t post[sizeof(kTileFlushPre)];
+	memcpy(post, kTileFlushPre, sizeof(post));
+	post[kTileFlushPatchAt] = kTileFlushPost;
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	uint32_t n = 0, nPost = 0;
+	size_t at = 0;
+	for (size_t i = 0; i + sizeof(kTileFlushPre) <= size; i++) {
+		if (img[i] != 0x48) continue;
+		if (memcmp(img + i, kTileFlushPre, sizeof(kTileFlushPre)) == 0) { if (n++ == 0) at = i; }
+		else if (memcmp(img + i, post, sizeof(post)) == 0) { if (nPost++ == 0) at = i; }
+	}
+	if (n + nPost == 0) return;
+	if (n + nPost > 1) return;
+	if (nPost == 1) return;
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	const_cast<uint8_t *>(img)[at + kTileFlushPatchAt] = kTileFlushPost;
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+}
+
+static constexpr uint32_t kAuxFlushAccelBits = 0x1380;
+static constexpr uint32_t kAuxFlushSites = 3;
+static const uint8_t kAuxFlushPre[14] = {0x48, 0xf7, 0xd6,
+                                     0x48, 0x21, 0xf1,
+                                     0x48, 0x89, 0x8c, 0xd0, 0x80, 0x13, 0x00, 0x00};
+static const uint8_t kAuxFlushMid[6] = {0x48, 0x31, 0xf1,
+                                    0x80, 0xc9, 0x01};
+static const uint8_t kAuxFlushStore[8] = {0x48, 0x89, 0x8c, 0xd0, 0x80, 0x13, 0x00, 0x00};
+static volatile bool gAuxFlushPatched = false;
+
+static void patchAuxFlush(mach_vm_address_t address, size_t size) {
+	gAuxFlushPatched = false;
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	struct Site { size_t at; uint32_t len; bool r14, post; int64_t target; };
+	Site s[kAuxFlushSites + 1];
+	uint32_t n = 0, nPost = 0;
+	for (size_t i = 0; i + 27 <= size && n <= kAuxFlushSites; i++) {
+		const uint8_t b = img[i];
+		if (b == 0x48 && memcmp(img + i, kAuxFlushPre, sizeof(kAuxFlushPre)) == 0) {
+			const bool rbx = img[i + 14] == 0x48 && img[i + 15] == 0x89 && img[i + 16] == 0xdf &&
+			                 img[i + 22] == 0xc6 && img[i + 23] == 0x43 && img[i + 24] == 0x6e && img[i + 25] == 0x00;
+			const bool r14 = img[i + 14] == 0x4c && img[i + 15] == 0x89 && img[i + 16] == 0xf7 && img[i + 22] == 0x41 &&
+			                 img[i + 23] == 0xc6 && img[i + 24] == 0x46 && img[i + 25] == 0x6e && img[i + 26] == 0x00;
+			if ((!rbx && !r14) || img[i + 17] != 0xe8) continue;
+			int32_t rel;
+			memcpy(&rel, img + i + 18, 4);
+			if (n < kAuxFlushSites) s[n] = Site {i, r14 ? 27u : 26u, r14, false, static_cast<int64_t>(i) + 22 + rel};
+			n++;
+		} else if ((b == 0xc6 || b == 0x41) && (memcmp(img + i + (b == 0x41 ? 5 : 4), kAuxFlushMid, sizeof(kAuxFlushMid)) == 0)) {
+			const bool r14 = b == 0x41;
+			const uint32_t c = r14 ? 5u : 4u;
+			const bool lead = r14 ? (img[i + 1] == 0xc6 && img[i + 2] == 0x46 && img[i + 3] == 0x6e && img[i + 4] == 0x00)
+			                      : (img[i + 1] == 0x43 && img[i + 2] == 0x6e && img[i + 3] == 0x00);
+			if (!lead || memcmp(img + i + c + 6, kAuxFlushStore, sizeof(kAuxFlushStore)) != 0) continue;
+			const uint32_t mv = c + 14;
+			if (img[i + mv + 3] != 0xe8) continue;
+			int32_t rel;
+			memcpy(&rel, img + i + mv + 4, 4);
+			if (n < kAuxFlushSites) s[n] = Site {i, r14 ? 27u : 26u, r14, true, static_cast<int64_t>(i) + mv + 8 + rel};
+			n++; nPost++;
+		}
+	}
+	if (n != kAuxFlushSites) return;
+	if (s[1].target != s[0].target || s[2].target != s[0].target) return;
+	if (nPost == kAuxFlushSites) { gAuxFlushPatched = true; return; }
+	if (nPost != 0) return;
+	uint8_t nw[kAuxFlushSites][27];
+	for (uint32_t k = 0; k < kAuxFlushSites; k++) {
+		uint8_t *p = nw[k];
+		uint32_t o = 0;
+		if (s[k].r14) { const uint8_t m[5] = {0x41, 0xc6, 0x46, 0x6e, 0x00}; memcpy(p, m, 5); o = 5; }
+		else { const uint8_t m[4] = {0xc6, 0x43, 0x6e, 0x00}; memcpy(p, m, 4); o = 4; }
+		memcpy(p + o, kAuxFlushMid, sizeof(kAuxFlushMid)); o += sizeof(kAuxFlushMid);
+		memcpy(p + o, kAuxFlushStore, sizeof(kAuxFlushStore)); o += sizeof(kAuxFlushStore);
+		if (s[k].r14) { p[o] = 0x4c; p[o + 1] = 0x89; p[o + 2] = 0xf7; }
+		else { p[o] = 0x48; p[o + 1] = 0x89; p[o + 2] = 0xdf; }
+		o += 3;
+		p[o] = 0xe8;
+		const int32_t rel = static_cast<int32_t>(s[k].target - static_cast<int64_t>(s[k].at + o + 5));
+		memcpy(p + o + 1, &rel, 4);
+		o += 5;
+		if (o != s[k].len) return;
+	}
+	if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) return;
+	for (uint32_t k = 0; k < kAuxFlushSites; k++) memcpy(const_cast<uint8_t *>(img + s[k].at), nw[k], s[k].len);
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+	bool stuck = true;
+	for (uint32_t k = 0; k < kAuxFlushSites; k++) stuck = stuck && memcmp(img + s[k].at, nw[k], s[k].len) == 0;
+	gAuxFlushPatched = stuck;
+}
+
+static void armAuxFlushBit(void *accel) {
+	if (accel == nullptr) return;
+	auto *bits = reinterpret_cast<volatile uint64_t *>(static_cast<uint8_t *>(accel) + kAuxFlushAccelBits);
+	if (gAuxFlushPatched) __sync_fetch_and_or(bits, 1ull);
+}
+
 static IOSimpleLock *gCtxFreeLock = nullptr;
 static volatile uint32_t gCtxFreeRouted = 0;
 
@@ -417,7 +551,80 @@ static void blit3dInitAfter(void *pool) {
 	reinterpret_cast<SubmitBuffer>(Gen11::callback->oIOAF2_submitBuffer)(pool);
 }
 
+static mach_vm_address_t gOrgResolveInit = 0;
+
+static bool wrapResolveInit(void *pool, void *buffer, uint64_t arg, bool flag) {
+	auto *cb = Gen11::callback;
+	auto *p = static_cast<uint8_t *>(pool);
+	auto *ch = p != nullptr ? getMember<uint8_t *>(p, 0x20) : nullptr;
+	const bool own = cb != nullptr && cb->oIOAF2_submitBuffer != 0 && ch != nullptr;
+	if (own) {
+		using IncrementStamp = void (*)(void *);
+		const auto vt = *reinterpret_cast<uintptr_t *>(ch);
+		reinterpret_cast<IncrementStamp>(*reinterpret_cast<uintptr_t *>(vt + 0x148))(ch);
+	}
+	const bool rc = FunctionCast(wrapResolveInit, gOrgResolveInit)(pool, buffer, arg, flag);
+	if (own) {
+		const uint64_t seg = *reinterpret_cast<volatile uint64_t *>(p + 0x1848);
+		const uint64_t ptr = *reinterpret_cast<volatile uint64_t *>(p + 0x1858);
+		if (ptr >= seg) {
+			auto *end = reinterpret_cast<volatile uint32_t *>(ptr);
+			end[0] = 0x05000000u;
+			end[1] = 0u;
+			*reinterpret_cast<volatile uint64_t *>(p + 0x1858) = ptr + 8;
+			using SubmitBuffer = void (*)(void *);
+			reinterpret_cast<SubmitBuffer>(cb->oIOAF2_submitBuffer)(pool);
+		}
+	}
+	return rc;
+}
+
 static volatile uint32_t gBarrierArmed = 1u;
+
+static volatile uint32_t gHaveBiosRc6 = 0;
+static volatile uint32_t gBiosRc = 0, gBiosPg = 0;
+static constexpr uint32_t kRc6FwBit = 1u << 5;
+static constexpr uint32_t kRc6AckNeed = 3u;
+static uint32_t rc6FwGet() {
+	auto *cb = NGreen::callback;
+	const uint32_t req = (kRc6FwBit << 16) | kRc6FwBit, need = kRc6AckNeed;
+	cb->writeReg32(FORCEWAKE_RENDER_GEN9, req);
+	cb->writeReg32(FORCEWAKE_GT_GEN9, req);
+	uint32_t acks = 0;
+	for (int i = 0; i < 500 && (acks & need) != need; i++) {
+		acks = 0;
+		if (cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & kRc6FwBit) acks |= 1u;
+		if (cb->readReg32(FORCEWAKE_ACK_GT_GEN9) & kRc6FwBit) acks |= 2u;
+		if ((acks & need) != need) IODelay(10);
+	}
+	return acks;
+}
+static inline bool rc6Acked(uint32_t acks) { return (acks & kRc6AckNeed) == kRc6AckNeed; }
+static void rc6FwPut() {
+	auto *cb = NGreen::callback;
+	const uint32_t clr = kRc6FwBit << 16;
+	cb->writeReg32(FORCEWAKE_RENDER_GEN9, clr);
+	cb->writeReg32(FORCEWAKE_GT_GEN9, clr);
+}
+static void applyRc6(uint32_t mode) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || !cb->mmioMapped()) return;
+	const uint32_t acks = rc6FwGet();
+	const uint32_t biosRc = cb->readReg32(0xa090u), biosPg = cb->readReg32(0xa210u);
+	if (rc6Acked(acks) && __sync_bool_compare_and_swap(&gHaveBiosRc6, 0u, 1u)) { gBiosRc = biosRc; gBiosPg = biosPg; }
+	uint32_t rc = gHaveBiosRc6 ? gBiosRc : biosRc, pg = gHaveBiosRc6 ? gBiosPg : biosPg;
+	if (mode & 1u) pg &= ~1u;
+	if (mode & 4u) pg |= 1u;
+	if (mode & 2u) rc = 0;
+	if (rc6Acked(acks) && biosPg != pg) cb->writeReg32(0xa210u, pg);
+	if (rc6Acked(acks) && biosRc != rc) cb->writeReg32(0xa090u, rc);
+	rc6FwPut();
+}
+static void rc6ProbeTick() {
+	static volatile uint32_t once = 0;
+	if (!__sync_bool_compare_and_swap(&once, 0u, 1u)) return;
+	applyRc6(RAPTOR_LAKE_HX_OR(4u, 0u));
+}
 
 static bool barrierWants() {
 	return gBarrierArmed != 0;
@@ -766,6 +973,36 @@ static void scanoutSnapshot(bool late) {
 	clearDssOnce();
 }
 
+static constexpr uint64_t kResolvePoolWindow = 0xff8;
+static constexpr uint64_t kResolvePoolBufApple = 0x1000, kResolvePoolBufBlit3D = 0x10000;
+static void bumpResolveBufferSize(void *params) {
+	auto *sz = reinterpret_cast<volatile uint64_t *>(static_cast<uint8_t *>(params) + 0x20);
+	if (*sz == kResolvePoolBufApple) *sz = kResolvePoolBufBlit3D;
+}
+static void reserveResolveWindow(void *ctx) {
+	auto *pool = getMember<uint8_t *>(ctx, 0xe0);
+	if (pool == nullptr) return;
+	const uint64_t seg = *reinterpret_cast<volatile uint64_t *>(pool + 0x1848);
+	const uint64_t lim = *reinterpret_cast<volatile uint64_t *>(pool + 0x1850);
+	const uint64_t ptr = *reinterpret_cast<volatile uint64_t *>(pool + 0x1858);
+	if (ptr == 0 || lim == 0) return;
+	const uint64_t roomPre = lim > ptr ? lim - ptr : 0;
+	if (roomPre >= kResolvePoolWindow) return;
+	const bool pending = ptr > seg;
+	auto *cb = Gen11::callback;
+	if (cb == nullptr || cb->oIOAF2_getBufferPtrNoInc == 0) return;
+	if (pending) {
+		auto *ch = getMember<uint8_t *>(pool, 0x20);
+		if (ch != nullptr) {
+			using IncrementStamp = void (*)(void *);
+			const auto vt = *reinterpret_cast<uintptr_t *>(ch);
+			reinterpret_cast<IncrementStamp>(*reinterpret_cast<uintptr_t *>(vt + 0x148))(ch);
+		}
+	}
+	using GetBufferPtrNoInc = uint32_t *(*)(void *, uint32_t);
+	reinterpret_cast<GetBufferPtrNoInc>(cb->oIOAF2_getBufferPtrNoInc)(pool, static_cast<uint32_t>(kResolvePoolWindow / 4));
+}
+
 static void scanoutLate(thread_call_param_t, thread_call_param_t) {
 	const uint32_t n = __sync_add_and_fetch(&gScanoutLateFires, 1u);
 	if (n <= 3) scanoutSnapshot(true);
@@ -1094,6 +1331,13 @@ static uint32_t getV65Tier1WantBits(bool isRealTGL) {
 	}
 
 	return (1u << GEN11_RCS0);
+}
+
+void Gen11::routeResolveInit(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	RouteRequestPlus route[] = {
+		{"__Z19resolve_init_ctx_g7P25IOAccelCommandBufferPool2P14IGMappedBufferyb", wrapResolveInit, gOrgResolveInit},
+	};
+	if (!RouteRequestPlus::routeAll(patcher, index, route, address, size)) patcher.clearError();
 }
 
 static int getV77KillDelayIterations() {
@@ -2186,6 +2430,10 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			if (!RouteRequestPlus::routeAll(patcher, index, hangRoute, address, size)) patcher.clearError();
 		}
 		patchDsbSize(address, size);
+		patchResolveEop(address, size);
+		patchTileFlush(address, size);
+		patchAuxFlush(address, size);
+		routeResolveInit(patcher, index, address, size);
 
 		{
 			RouteRequestPlus startRoute[] = {
@@ -5632,6 +5880,10 @@ unsigned long Gen11::start(void *that,void  *param_1)
 
 	// V221: Signal waitForStamp hook that the GFX interrupt handler is now installed.
 	Gen11::gGfxAccelStartDone = ret != 0;
+	if (!NGreen::callback->isRealTGL && ret) {
+		armAuxFlushBit(that);
+		Gen11::armEngineProbe(that);
+	}
 
 	// V65: IMMEDIATELY after original start() returns, re-enable RCS0 interrupts.
 	// Apple's init code may have overwritten our pre-start settings.
@@ -7371,6 +7623,8 @@ uint64_t Gen11::IGHardwareExtendedContextinitWithOptions(void *that,void *param_
 	}
 	if (param_2 != nullptr && callback->Blit3DExtendedCtxParams != 0 && reinterpret_cast<mach_vm_address_t>(param_2) == callback->Blit3DExtendedCtxParams)
 		roundScratchSize(param_2);
+	if (param_2 != nullptr && callback->ResolveExtendedCtxParams != 0 && reinterpret_cast<mach_vm_address_t>(param_2) == callback->ResolveExtendedCtxParams)
+		bumpResolveBufferSize(param_2);
 	uint64_t ret = FunctionCast(IGHardwareExtendedContextinitWithOptions, callback->oIGHardwareExtendedContextinitWithOptions)(that,param_1,param_2);
 	void *b8post = getMember<void *>(that, 0xb8);
 	// V115 REMOVED: V115 suppressed initWithOptions to prevent MCE from GGTT[0]→stolen mem.
@@ -8113,6 +8367,8 @@ void * Gen11::getColorResolveContext(void *that,bool param_1)
 				   static_cast<unsigned>(param_1), ctx, ctxField);
 		}
 	}
+	if (ctx != nullptr)
+		reserveResolveWindow(ctx);
 	return ctx;
 }
 
@@ -9700,8 +9956,18 @@ uint64_t Gen11::v116DummyPhys = 0;
 volatile bool Gen11::gGfxAccelStartDone = false;
 
 static constexpr size_t   kHWCS5HwspPtrOffset   = 0x68;
+static constexpr uint32_t kEngineProbeFwBit  = 1u << 4;
+
+static constexpr uint32_t kEngineProbeIntervalMs   = 250;
+static constexpr uint32_t kEngineProbeMaxSamples   = 480;
+static IOService        *gEngineProbeAccelService = nullptr;
+static thread_call_t     gEngineProbeCall    = nullptr;
+static volatile uint32_t gEngineProbeStop         = 0;
+static uint32_t          gEngineProbeSamples      = 0;
 
 static constexpr uint32_t kRcsMaxStreamers = 8;
+static constexpr uint32_t kRcsMaxAttempts  = 24;
+static constexpr size_t   kRcsSchedulerOffset = 0x20;
 
 struct RcsStreamer {
 	void     *cs;
@@ -9710,9 +9976,174 @@ struct RcsStreamer {
 };
 static RcsStreamer      gRcsStreamers[kRcsMaxStreamers] = {};
 static volatile uint32_t gRcsCount     = 0;
+static void * volatile   gRcsSubmitCs  = nullptr;
+static uint32_t          gRcsSelected  = 0;
+static uint32_t          gRcsAttempts  = 0;
 
 void *gFinishTimerCommandStreamer = nullptr;
 void *gFinishTimerScheduler       = nullptr;
+
+static bool readPhys64(uint64_t pa, uint64_t &out) {
+	if (isStolen(pa)) return false;
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(
+	    static_cast<IOPhysicalAddress>(pa & ~0xFFFull), 4096, kIODirectionIn);
+	if (desc == nullptr) return false;
+	auto *map = desc->createMappingInTask(kernel_task, 0,
+	    kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
+	if (map == nullptr) {
+		desc->release();
+		return false;
+	}
+	out = *reinterpret_cast<volatile const uint64_t *>(
+	    static_cast<uintptr_t>(map->getVirtualAddress()) + (pa & 0xFFFull));
+	map->release();
+	desc->release();
+	return true;
+}
+
+static uint64_t physOfKernelVA(const volatile void *vap) {
+	const uint64_t va = reinterpret_cast<uint64_t>(vap);
+	uint64_t tbl = get_cr3_base();
+	const uint32_t idx[4] = {
+	    static_cast<uint32_t>((va >> 39) & 0x1FF),
+	    static_cast<uint32_t>((va >> 30) & 0x1FF),
+	    static_cast<uint32_t>((va >> 21) & 0x1FF),
+	    static_cast<uint32_t>((va >> 12) & 0x1FF)};
+	for (int lvl = 0; lvl < 4; lvl++) {
+		uint64_t e = 0;
+		if (!readPhys64(tbl + (static_cast<uint64_t>(idx[lvl]) << 3), e)) return 0;
+		if ((e & 1ull) == 0) return 0;
+		if (lvl == 3) return (e & 0x000FFFFFFFFFF000ull) | (va & 0xFFFull);
+		if (e & (1ull << 7)) {
+			if (lvl == 1) return (e & 0x000FFFFFC0000000ull) | (va & 0x3FFFFFFFull);
+			return (e & 0x000FFFFFFFE00000ull) | (va & 0x1FFFFFull);
+		}
+		tbl = e & 0x000FFFFFFFFFF000ull;
+	}
+	return 0;
+}
+
+static void rcsRetarget(uint64_t want) {
+	if (gRcsSelected) return;
+	gRcsAttempts++;
+
+	const uint32_t seen = __sync_fetch_and_or(&gRcsCount, 0u);
+	const uint32_t lim  = seen < kRcsMaxStreamers ? seen : kRcsMaxStreamers;
+	void    *pick = nullptr;
+
+	for (uint32_t i = 0; i < lim; i++) {
+		if (gRcsStreamers[i].cs == nullptr) continue;
+		if (gRcsStreamers[i].hwsp == nullptr)
+			gRcsStreamers[i].hwsp = *reinterpret_cast<void **>(
+			    static_cast<uint8_t *>(gRcsStreamers[i].cs) + kHWCS5HwspPtrOffset);
+		if (gRcsStreamers[i].hwspPhys == 0 && gRcsStreamers[i].hwsp != nullptr)
+			gRcsStreamers[i].hwspPhys = physOfKernelVA(gRcsStreamers[i].hwsp);
+
+		if (pick == nullptr && want != 0 && gRcsStreamers[i].hwspPhys == want) pick = gRcsStreamers[i].cs;
+	}
+
+	if (pick == nullptr) pick = gRcsSubmitCs;
+
+	if (pick == nullptr) {
+		if (gRcsAttempts >= kRcsMaxAttempts) gRcsSelected = 1;
+		return;
+	}
+
+	gRcsSelected = 1;
+	if (pick != gFinishTimerCommandStreamer) {
+		gFinishTimerCommandStreamer = pick;
+		void *sc = *reinterpret_cast<void **>(static_cast<uint8_t *>(pick) + kRcsSchedulerOffset);
+		if (sc != nullptr) gFinishTimerScheduler = sc;
+	}
+}
+
+static void stopEngineProbe() {
+	__sync_lock_test_and_set(&gEngineProbeStop, 1u);
+	auto call = gEngineProbeCall;
+	auto *service = gEngineProbeAccelService;
+	gEngineProbeCall = nullptr;
+	gEngineProbeAccelService = nullptr;
+	if (call) thread_call_free(call);
+	if (service) service->release();
+}
+
+void Gen11::engineProbeTick(thread_call_param_t, thread_call_param_t) {
+	auto *service = gEngineProbeAccelService;
+	if (__sync_fetch_and_or(&gEngineProbeStop, 0u) != 0 || !service || service->isInactive() || !NGreen::callback || !NGreen::callback->mmioValid()) {
+		stopEngineProbe();
+		return;
+	}
+	auto *cb = NGreen::callback;
+	cb->writeReg32(FORCEWAKE_RENDER_GEN9, (kEngineProbeFwBit << 16) | kEngineProbeFwBit);
+	for (int i = 0; i < 50; i++) {
+		if (cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & kEngineProbeFwBit) break;
+		IODelay(10);
+	}
+	rc6ProbeTick();
+	const uint32_t index = ++gEngineProbeSamples;
+	const uint32_t execStatus = cb->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
+	const uint32_t head = cb->readReg32(RING_HEAD(RENDER_RING_BASE));
+	const uint32_t tail = cb->readReg32(RING_TAIL(RENDER_RING_BASE));
+	const uint32_t gt0 = cb->readReg32(GEN11_GT_INTR_DW0);
+	uint64_t hwsPgaPhys = 0;
+	const uint32_t hwsPga = cb->readReg32(RING_HWS_PGA(RENDER_RING_BASE));
+	if (hwsPga != 0 && hwsPga != 0xffffffffu) {
+		const uint32_t hwsPteLo = cb->readReg32(GGTT_PTE_LO(hwsPga >> 12));
+		const uint32_t hwsPteHi = cb->readReg32(GGTT_PTE_HI(hwsPga >> 12));
+		if ((hwsPteLo & 1) != 0)
+			hwsPgaPhys = (static_cast<uint64_t>(hwsPteHi & 0x000FFFFFu) << 32) | (hwsPteLo & 0xFFFFF000ull);
+	}
+	const uint32_t csDebug = cb->readReg32(GEN9_CS_DEBUG_MODE1);
+	const uint32_t ffMode = cb->readReg32(GEN7_FF_THREAD_MODE);
+	if (csDebug != 0xffffffffu && ffMode != 0xffffffffu &&
+	    ((csDebug & FF_DOP_CLOCK_GATE_DISABLE) == 0 || (ffMode & GEN12_FF_TESSELATION_DOP_GATE_DISABLE) == 0))
+		applyRenderWa(cb, false);
+	cb->writeReg32(FORCEWAKE_RENDER_GEN9, (kEngineProbeFwBit << 16) | 0);
+	rcsRetarget(hwsPgaPhys);
+	if (gBurstPrevExec != 0xffffffffu && gBurstLeft == 0) {
+		const bool wasRunning = (gBurstPrevExec & 0x18u) != 0 || gBurstPrevExec == 0x18001u;
+		const bool nowLoaded  = (execStatus & 0x18u) != 0;
+		const bool bit30RoseOnStaticRing =
+		    (gBurstPrevExec & 0x40000000u) == 0 && (execStatus & 0x40000000u) != 0 &&
+		    (execStatus & 0x18u) != 0 && (execStatus & 0x60000u) == 0 &&
+		    head == tail && head == gBurstPrevHead;
+		if (((!wasRunning && nowLoaded) || bit30RoseOnStaticRing) && head == tail && gt0 == 0)
+			gBurstLeft = 24;
+	}
+	gBurstPrevExec = execStatus;
+	gBurstPrevHead = head;
+	if (index >= kEngineProbeMaxSamples) {
+		stopEngineProbe();
+		return;
+	}
+	if (__sync_fetch_and_or(&gEngineProbeStop, 0u) == 0 && gEngineProbeCall != nullptr) {
+		uint64_t deadline;
+		if (gBurstLeft > 0) {
+			clock_interval_to_deadline(10, kMillisecondScale, &deadline);
+			gBurstLeft--;
+		} else {
+			clock_interval_to_deadline(kEngineProbeIntervalMs, kMillisecondScale, &deadline);
+		}
+		thread_call_enter_delayed(gEngineProbeCall, deadline);
+	}
+}
+
+void Gen11::armEngineProbe(void *accel) {
+	if (gEngineProbeCall != nullptr || accel == nullptr || callback == nullptr) return;
+	gEngineProbeSamples = 0;
+	gRcsSelected = 0;
+	gRcsAttempts = 0;
+	if (!NGreen::callback || !NGreen::callback->mmioValid()) return;
+	gEngineProbeCall = thread_call_allocate(engineProbeTick, nullptr);
+	if (gEngineProbeCall == nullptr) return;
+	auto *service = static_cast<IOService *>(accel);
+	service->retain();
+	gEngineProbeAccelService = service;
+	__sync_lock_test_and_set(&gEngineProbeStop, 0u);
+	uint64_t deadline;
+	clock_interval_to_deadline(kEngineProbeIntervalMs, kMillisecondScale, &deadline);
+	thread_call_enter_delayed(gEngineProbeCall, deadline);
+}
 
 static constexpr size_t kHWCS5SchedulerOffset   = 0x20;
 static constexpr size_t kHWCS5FinishSourceOffset = 0x1c08;

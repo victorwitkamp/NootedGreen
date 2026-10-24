@@ -543,6 +543,14 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		}
 
 		if (Gen11::callback) {
+			SolveRequestPlus resolvePoolSolve[] = {
+				{"__ZN25IOAccelCommandBufferPool217getBufferPtrNoIncEj", Gen11::callback->oIOAF2_getBufferPtrNoInc},
+			};
+			if (!SolveRequestPlus::solveAll(patcher, index, resolvePoolSolve, address, size))
+				patcher.clearError();
+		}
+
+		if (Gen11::callback) {
 			SolveRequestPlus blit3dInitSolve[] = {
 				{"__ZN25IOAccelCommandBufferPool212submitBufferEv", Gen11::callback->oIOAF2_submitBuffer},
 			};
