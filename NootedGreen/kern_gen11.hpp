@@ -1505,6 +1505,10 @@ private:
 	static uint64_t getOSInformation(AppleIntel::AppleIntelBaseController *that);
 	mach_vm_address_t ogetOSInformation {};
 	
+	static uint64_t metricsLogStub(void *that, uint32_t command, uint32_t a, uint32_t b);
+
+	static uint32_t hwSaveNVRAMStub(void *that);
+
 	static uint8_t setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2);
 	mach_vm_address_t osetDisplayMode {};
 	

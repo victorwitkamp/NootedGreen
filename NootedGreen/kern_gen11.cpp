@@ -741,6 +741,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				// V201 diagnostic: read scanout buffer right after hwSetupMemory returns to
 				// detect what fills it (zeros vs wallpaper pixels). FB-only scope.
 				{"__ZN24AppleIntelBaseController13hwSetupMemoryEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsb", wrapHwSetupMemory, this->ohwSetupMemory},
+				{"__ZN24AppleIntelBaseController10metricsLogE14kAGDCCommand_tjjz", metricsLogStub},
+				{"__ZN24AppleIntelBaseController11hwSaveNVRAMEv", hwSaveNVRAMStub},
 			};
 			static constexpr mach_vm_address_t requestOffsets[] = {
 				0x3CFE8,
@@ -757,10 +759,31 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				0xA4D46,
 				0x732DC,
 				0x6DF9E,
+				0xA284C,
+				0x77A5A,
 			};
 			PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
 				"ngreen", "Failed to route TGL debug controller offsets");
 			
+			static const uint8_t forceWakeGTAckLoopFind[]    = {0x45, 0x38, 0xe7, 0x75, 0x9d, 0x45, 0x84, 0xe4};
+			static const uint8_t forceWakeGTAckLoopMask[]    = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+			static const uint8_t forceWakeGTAckLoopReplace[] = {0x45, 0x38, 0xe7, 0x90, 0x90, 0x45, 0x84, 0xe4};
+			static const uint8_t forceWakeGTAckLoopReplMask[]= {0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00};
+
+			const LookupPatchPlus forceWakeGTAckPatch {&kextG11FBT, forceWakeGTAckLoopFind, forceWakeGTAckLoopMask,
+				forceWakeGTAckLoopReplace, forceWakeGTAckLoopReplMask, 1};
+
+			forceWakeGTAckPatch.apply(patcher, address, size);
+			patcher.clearError();
+
+			static const uint8_t controllerRegSvc_f[]  = {0x49, 0x8b, 0x45, 0x00, 0x4c, 0x89, 0xef, 0x31, 0xf6, 0xff, 0x90, 0xb0, 0x05, 0x00, 0x00};
+			static const uint8_t controllerRegSvc_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+			static const uint8_t controllerRegSvc_r[]  = {0x49, 0x8b, 0x45, 0x00, 0x4c, 0x89, 0xef, 0x31, 0xf6, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+			static const uint8_t controllerRegSvc_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+			const LookupPatchPlus controllerRegSvcPatch {&kextG11FBT, controllerRegSvc_f, controllerRegSvc_m,
+				controllerRegSvc_r, controllerRegSvc_rm, 1};
+			controllerRegSvcPatch.apply(patcher, address, size);
+			patcher.clearError();
 		}
 		}();
 		
@@ -3248,6 +3271,16 @@ void Gen11::initPlatformWorkarounds(AppleIntel::AppleIntelBaseController *that)
 		SYSLOG("ngreen", "V212: ADL-P Display 13+ workarounds applied — PIPE_CHICKEN(A)=0x%x CLKGATE_DIS_5=0x%x CHICKEN_DCPR_1=0x%x ERR_FATAL_MASK=0x%x",
 			   pipeChicken, clkGateDis5, chickenDcpr1, errFatalMask);
 	}
+}
+
+uint64_t Gen11::metricsLogStub(void *, uint32_t, uint32_t, uint32_t)
+{
+	return 0;
+}
+
+uint32_t Gen11::hwSaveNVRAMStub(void *)
+{
+	return 0;
 }
 
 uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
