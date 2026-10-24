@@ -1562,9 +1562,12 @@ private:
 	static IOReturn wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length);
 	mach_vm_address_t orgICLReadAUX {};
 	static void routeAUXTransactionGuard(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
+	static void routeEnhancedFraming(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
 
 	static IOReturn wrapRunAUXCommand(void *that, uint32_t command, uint32_t *data, uint32_t length, bool flag);
+	static IOReturn wrapSetLinkTrainingPattern(void *that, uint32_t pattern);
 	mach_vm_address_t orgRunAUXCommand {};
+	mach_vm_address_t oSetLinkTrainingPattern {};
 	
 	static int blit3d_supported();
 	

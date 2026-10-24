@@ -89,6 +89,70 @@ static bool isExpectedTGLDebugFramebuffer(mach_vm_address_t address, size_t size
 
 static mach_vm_address_t gTGLFbBase = 0;
 
+struct EdpTranscoderSite {
+	uint32_t    cmpOff;
+	uint32_t    jccOff;
+	uint8_t     pre[24];
+	uint8_t     preLen;
+};
+
+static const EdpTranscoderSite kEdpTranscoderSites[] = {
+	{ 0x67de2, 0x67de6, { 0x83, 0x78, 0x08, 0x00, 0x75, 0x0d, 0x48, 0xff, 0x05, 0xa1, 0xd9, 0x0e, 0x00, 0x41, 0xbc, 0x0f, 0x00, 0x00, 0x00 }, 19 },
+	{ 0x683dc, 0x683e4, { 0x83, 0x78, 0x08, 0x00, 0x48, 0x8b, 0x55, 0xd0, 0x75, 0x13, 0x48, 0xff, 0x05, 0xa3, 0xd3, 0x0e, 0x00, 0x41, 0xbc, 0x0f, 0x00, 0x00, 0x00 }, 23 },
+	{ 0x685e1, 0x685e5, { 0x83, 0x7a, 0x08, 0x00, 0x75, 0x0c, 0x48, 0xff, 0x05, 0xa2, 0xd1, 0x0e, 0x00, 0xb8, 0x0f, 0x00, 0x00, 0x00 }, 18 },
+	{ 0x71b46, 0x71b4a, { 0x83, 0x78, 0x08, 0x00, 0x75, 0x0d, 0x48, 0xff, 0x05, 0x3d, 0x3c, 0x0e, 0x00, 0x41, 0xbe, 0x0f, 0x00, 0x00, 0x00 }, 19 },
+	{ 0x74704, 0x74708, { 0x83, 0x78, 0x08, 0x00, 0x75, 0x0d, 0x48, 0xff, 0x05, 0x7f, 0x10, 0x0e, 0x00, 0x41, 0xbf, 0x0f, 0x00, 0x00, 0x00 }, 19 },
+	{ 0x78e8d, 0x78e91, { 0x83, 0x78, 0x08, 0x00, 0x75, 0x0d, 0x48, 0xff, 0x05, 0xf6, 0xc8, 0x0d, 0x00, 0x41, 0xbe, 0x0f, 0x00, 0x00, 0x00 }, 19 },
+	{ 0x805f7, 0x805ff, { 0x83, 0x78, 0x08, 0x00, 0x48, 0x8b, 0x5d, 0xd0, 0x75, 0x1a, 0x48, 0xff, 0x05, 0x88, 0x51, 0x0d, 0x00, 0x41, 0xbc, 0x0f, 0x00, 0x00, 0x00 }, 23 },
+	{ 0x80a0e, 0x80a12, { 0x83, 0x78, 0x08, 0x00, 0x75, 0x0d, 0x48, 0xff, 0x05, 0x75, 0x4d, 0x0d, 0x00, 0x41, 0xbe, 0x0f, 0x00, 0x00, 0x00 }, 19 },
+	{ 0x80db1, 0x80db5, { 0x83, 0x78, 0x08, 0x00, 0x75, 0x0d, 0x48, 0xff, 0x05, 0xd2, 0x49, 0x0d, 0x00, 0x41, 0xbd, 0x0f, 0x00, 0x00, 0x00 }, 19 },
+};
+
+static void patchEdpTranscoder(mach_vm_address_t address, size_t size) {
+	const uint8_t *img = reinterpret_cast<const uint8_t *>(address);
+	for (size_t i = 0; i < arrsize(kEdpTranscoderSites); ++i) {
+		const EdpTranscoderSite &st = kEdpTranscoderSites[i];
+		if (st.cmpOff + st.preLen > size || st.jccOff >= size) {
+			continue;
+		}
+		const uint8_t cur = img[st.jccOff];
+		if (cur == 0xeb) {
+			continue;
+		}
+		bool match = (cur == 0x75);
+		for (uint8_t k = 0; match && k < st.preLen; ++k)
+			if (img[st.cmpOff + k] != st.pre[k]) match = false;
+		if (!match) {
+			continue;
+		}
+		auto status = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock);
+		if (status != KERN_SUCCESS) {
+			continue;
+		}
+		*const_cast<uint8_t *>(img + st.jccOff) = 0xeb;
+		MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+	}
+}
+
+static constexpr uint32_t kDpTpEnhancedFrame = 0x40000u;
+static constexpr uint32_t kDpTpCtlA      = 0x60540u;
+
+IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
+	const IOReturn ret = FunctionCast(wrapSetLinkTrainingPattern,
+	    callback->oSetLinkTrainingPattern)(that, pattern);
+	auto *cb = NGreen::callback;
+	if (cb == nullptr || that == nullptr) return ret;
+
+	const uint32_t trans = getMember<uint32_t>(that, 0x3640);
+	if (trans > 3u) return ret;
+	const uint32_t reg = kDpTpCtlA + (trans << 12);
+	const uint32_t pre = cb->readReg32(reg);
+	if (!cb->mmioMapped()) return ret;
+	if ((pre & kDpTpEnhancedFrame) == 0) cb->writeReg32(reg, pre | kDpTpEnhancedFrame);
+	cb->readReg32(reg);
+	return ret;
+}
+
 static bool ensureA788DisplayAWells(bool requireDDI = true);
 
 static bool isKnownTGLImage(mach_vm_address_t address, size_t size) {
@@ -144,6 +208,18 @@ void Gen11::routeAUXTransactionGuard(KernelPatcher &patcher, mach_vm_address_t a
 	};
 	PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
 		"ngreen", "Failed to route TGL AUX transaction guard");
+}
+
+void Gen11::routeEnhancedFraming(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
+	RouteRequestPlus requests[] = {
+		{"__ZN21AppleIntelDisplayPath22setLinkTrainingPatternE19LinkTrainingPattern",
+		 wrapSetLinkTrainingPattern, callback->oSetLinkTrainingPattern},
+	};
+	static constexpr mach_vm_address_t requestOffsets[] = {
+		0xEE060,
+	};
+	PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
+		"ngreen", "Failed to route TGL enhanced framing");
 }
 
 void Gen11::init() {
@@ -719,6 +795,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				"ngreen", "Failed to route TGL debug sleep offsets");
 		}();
 		routeAUXTransactionGuard(patcher, address, size);
+		routeEnhancedFraming(patcher, address, size);
 
 		[&, this]() __attribute__((noinline)) {
 		if constexpr (isprod) {
@@ -1084,6 +1161,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			}
 		}
 		
+		patchEdpTranscoder(address, size);
+
 		return true;
 		
 		}();
@@ -2055,6 +2134,20 @@ void Gen11::setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
 		   params->DSC_ENGINE_SEL, params->DSC_JOINER_CTL, params->PPS_0, params->PPS_16);
 }
 
+static volatile uint32_t gTransFuncCtl = 0;
+static constexpr uint32_t kTransClkSelA     = 0x46140u;
+static constexpr uint32_t kTransDdiFuncCtlA = 0x60400u;
+static constexpr uint32_t kTransFuncEnable       = 0x80000000u;
+static constexpr uint32_t kTransFuncPortMask     = 0x78000000u;
+static constexpr uint32_t kTransFuncPortA        = 0x08000000u;
+static constexpr uint32_t kTransFuncModeMask     = 0x07000000u;
+static constexpr uint32_t kTransFuncModeDpSst    = 0x02000000u;
+
+static inline uint32_t clkSelFromFuncCtl(uint32_t funcCtl) {
+	const uint32_t sel = (funcCtl & kTransFuncPortMask) >> 27;
+	return sel == 0 ? 0u : (sel << 28);
+}
+
 // V403: AppleIntelBaseController::SetupParams — post-call.
 // Logs full CRTCParams + causation test: force PIPE_SEAM_EXCESS=0 and PS_PS_WIN_SZ=0
 // so any seam-join config Apple set up earlier in the modeset is wiped after the
@@ -2070,12 +2163,18 @@ void Gen11::setupParams(AppleIntel::AppleIntelBaseController *that,
 
 	if (NGreen::callback == nullptr || NGreen::callback->isRealTGL || params == nullptr) return;
 
-	// V403-zero: causation test. Wipe seam-join CRTCParams fields BEFORE any
-	// post-SetupParams consumer reads them (paramsSurfCompare, MMIO emit etc).
+	if (NGreen::callback->isRaptorLakeHX()) {
+		const uint32_t func = params->TRANS_DDI_FUNC_CTL;
+		const uint32_t clk  = params->TRANS_CLK_SEL;
+		const uint32_t want = clkSelFromFuncCtl(func);
+		gTransFuncCtl = func;
+		if (want != 0 && clk == 0) params->TRANS_CLK_SEL = want;
+	}
+
 	uint32_t pre_seam  = params->PIPE_SEAM_EXCESS;
 	uint32_t pre_winsz = params->PS_PS_WIN_SZ;
 	uint32_t pre_hphase = params->PS_HPHASE;
-	if (pre_seam != 0 || pre_winsz != 0 || pre_hphase != 0) {
+	if (!NGreen::callback->isRaptorLakeHX() && (pre_seam != 0 || pre_winsz != 0 || pre_hphase != 0)) {
 		params->PIPE_SEAM_EXCESS = 0;
 		params->PS_PS_WIN_SZ     = 0;
 		params->PS_HPHASE        = 0;
@@ -2089,7 +2188,8 @@ void Gen11::setupParams(AppleIntel::AppleIntelBaseController *that,
 		   "CLK_SEL=0x%x DDI_FUNC_CTL=0x%x DDI_FUNC_CTL2=0x%x MSA_MISC=0x%x "
 		   "HTOTAL=0x%x HBLANK=0x%x HSYNC=0x%x VTOTAL=0x%x VBLANK=0x%x VSYNC=0x%x "
 		   "PIPE_SRCSZ=0x%x TRANS_CONF=0x%x | "
-		   "PS_WIN_POS=0x%x | PRE: SEAM=0x%x WINSZ=0x%x HPHASE=0x%x -> NOW 0 | "
+		   "PS_WIN_POS=0x%x | PRE: SEAM=0x%x WINSZ=0x%x HPHASE=0x%x | "
+		   "POST: SEAM=0x%x WINSZ=0x%x HPHASE=0x%x | "
 		   "DSC_ENGINE=0x%x DSC_JOINER=0x%x PPS_0=0x%x PPS_16=0x%x",
 		   v403Count,
 		   params->TRANS_CLK_SEL, params->TRANS_DDI_FUNC_CTL, params->TRANS_DDI_FUNC_CTL2, params->TRANS_MSA_MISC,
@@ -2098,6 +2198,7 @@ void Gen11::setupParams(AppleIntel::AppleIntelBaseController *that,
 		   params->PIPE_SRCSZ, params->TRANS_CONF,
 		   params->PS_PS_WIN_POS,
 		   pre_seam, pre_winsz, pre_hphase,
+		   params->PIPE_SEAM_EXCESS, params->PS_PS_WIN_SZ, params->PS_HPHASE,
 		   params->DSC_ENGINE_SEL, params->DSC_JOINER_CTL, params->PPS_0, params->PPS_16);
 }
 
@@ -2602,6 +2703,19 @@ static void fixTxDw5() {
 
 IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 	auto *cb = NGreen::callback;
+	if (cb != nullptr && cb->mmioMapped()) {
+		const uint32_t funcBefore = cb->readReg32(kTransDdiFuncCtlA);
+		const uint32_t apple = gTransFuncCtl;
+		uint32_t funcWant;
+		if (apple != 0 && (apple & kTransFuncPortMask) != 0)
+			funcWant = apple & ~kTransFuncEnable;
+		else
+			funcWant = (funcBefore & ~(kTransFuncEnable | kTransFuncPortMask | kTransFuncModeMask)) | kTransFuncPortA | kTransFuncModeDpSst;
+		cb->writeReg32(kTransClkSelA, clkSelFromFuncCtl(funcWant));
+		(void)cb->readReg32(kTransClkSelA);
+		cb->writeReg32(kTransDdiFuncCtlA, funcWant);
+		(void)cb->readReg32(kTransClkSelA);
+	}
 	programDPLL0(getMember<uint8_t>(that, 0xf));
 	__sync_add_and_fetch(&gPhyTraining, 1u);
 	const IOReturn ret = FunctionCast(wrapLinkTraining, callback->oLinkTraining)(that, config);
