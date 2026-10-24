@@ -1509,7 +1509,7 @@ private:
 
 	static uint32_t hwSaveNVRAMStub(void *that);
 
-	static uint8_t setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2);
+	static int setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2);
 	mach_vm_address_t osetDisplayMode {};
 	
 	static uint8_t hwRegsNeedUpdate
@@ -1543,6 +1543,10 @@ private:
 	// The TGL FB uses getOnlineInfo instead; hook it here to unconditionally report online.
 	static void getOnlineInfo(AppleIntel::AppleIntelFramebuffer *that, AppleIntel::AppleIntelDisplayPath *displayPath, unsigned char *online, unsigned char *changed);
 	mach_vm_address_t ogetOnlineInfo {};
+
+	static IOReturn fbGetPixelInformation(void *that, int mode, int depth, int aperture, IOPixelInformation *info);
+	mach_vm_address_t ofbGetPixelInformation {};
+	static void routePixelInformation(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
 
 	// Path B: Force AppleIntelFramebuffer::isApertureMemoryRequired() to return true under
 	// dp0 mode so setupScanoutMemory never migrates from aperture to non-aperture memory
@@ -1673,10 +1677,7 @@ private:
 	mach_vm_address_t oConfigureColorPipeLine {};
 
 	// V406: AppleIntelPlane::configurePlane(FlipTransactionArgs*)
-	// Origin-level linear tiling fix: patch FlipTransactionArgs+0x3c tiling enum to 2
-	// (neither X-tiled=0 nor Y-tiled=1) so Apple computes PLANE_CTL bits[12:10]=000
-	// (linear) and PLANE_STRIDE = pitch_bytes/512 = 0x14. Physical pages are CPU-written
-	// linearly; forcing this here ensures the display engine fetches scanlines correctly.
+	// Pass-through with logging (kern_gen11.cpp selects V406_APPROACH_DIAGNOSTIC_ONLY).
 	static void configurePlane(AppleIntel::AppleIntelPlane *that, AppleIntel::FlipTransactionArgs *flipArgs);
 	mach_vm_address_t oConfigurePlane {};
 

@@ -134,6 +134,10 @@ static void patchEdpTranscoder(mach_vm_address_t address, size_t size) {
 	}
 }
 
+static thread_call_t     gScanoutLateCall   = nullptr;
+static volatile uint32_t gScanoutLateFires  = 0;
+static volatile uint32_t gImrFixDone    = 0;
+
 static constexpr uint32_t kDpTpEnhancedFrame = 0x40000u;
 static constexpr uint32_t kDpTpCtlA      = 0x60540u;
 
@@ -153,8 +157,24 @@ IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
 	return ret;
 }
 
+static bool gAuxSeen = false;
+
 static constexpr uint32_t kDssCtl1A  = 0x78000u;
 static constexpr uint32_t kDssCtl2A  = 0x78004u;
+
+static volatile uint32_t gDssClearDone     = 0;
+
+static bool vdscFlushInForce();
+
+static void clearDssOnce() {
+	if (vdscFlushInForce()) return;
+	if (__sync_val_compare_and_swap(&gDssClearDone, 0u, 1u) != 0u) return;
+	auto *cb = NGreen::callback;
+	if (cb == nullptr) return;
+	cb->writeReg32(kDssCtl1A, 0u);
+	cb->writeReg32(kDssCtl2A, 0u);
+	cb->readReg32(kDssCtl1A);
+}
 
 static void clearVdscGatePipeOff() {
 	auto *cb = NGreen::callback;
@@ -183,6 +203,10 @@ static volatile uint32_t gVdscRouted = 0, gVdscFlushed = 0;
 static volatile uint32_t gVdscLatchOn = 0;
 static uint32_t gVdscLatchDw[kVdscDwords];
 static const void *gVdscLatchPath = nullptr, *gVdscFlushPath = nullptr;
+
+static bool vdscFlushInForce() {
+	return gVdscFlushed != 0u;
+}
 
 static void vdscLatch(const void *params, const void *path) {
 	const uint32_t *src = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(params) + kVdscParamsDsc);
@@ -243,6 +267,37 @@ static constexpr uint32_t kPpsSettleMs = 50u;
 static constexpr uint8_t kSourceOUI[3] = {0x00, 0xAA, 0x01};
 
 static bool ensureA788DisplayAWells(bool requireDDI = true);
+static void scanoutSnapshot(bool late) {
+	auto *cb = NGreen::callback;
+	if (cb == nullptr) return;
+	if (__sync_bool_compare_and_swap(&gImrFixDone, 0u, 1u)) {
+		const uint32_t imrPre = cb->readReg32(0x44404);
+		if (imrPre & (1u << 31)) cb->writeReg32(0x44404, imrPre & ~(1u << 31));
+	}
+	if (late && cb->isRaptorLakeHX() && gAuxSeen)
+		ensureA788DisplayAWells(false);
+	clearDssOnce();
+}
+
+static void scanoutLate(thread_call_param_t, thread_call_param_t) {
+	const uint32_t n = __sync_add_and_fetch(&gScanoutLateFires, 1u);
+	if (n <= 3) scanoutSnapshot(true);
+	if (n < 3 && gScanoutLateCall != nullptr) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(10000, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gScanoutLateCall, deadline);
+	}
+}
+
+static void scanoutArmLate() {
+	if (gScanoutLateCall == nullptr)
+		gScanoutLateCall = thread_call_allocate_with_priority(scanoutLate, nullptr,
+		                                                  THREAD_CALL_PRIORITY_KERNEL);
+	if (gScanoutLateCall == nullptr) return;
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
+	thread_call_enter_delayed(gScanoutLateCall, deadline);
+}
 
 static bool isKnownTGLImage(mach_vm_address_t address, size_t size) {
 	static const uint8_t kKnown[][16] = {
@@ -309,6 +364,16 @@ void Gen11::routeEnhancedFraming(KernelPatcher &patcher, mach_vm_address_t addre
 	};
 	PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
 		"ngreen", "Failed to route TGL enhanced framing");
+}
+
+void Gen11::routePixelInformation(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
+	RouteRequestPlus requests[] = {
+		{"__ZN21AppleIntelFramebuffer19getPixelInformationEiiiP18IOPixelInformation", fbGetPixelInformation, callback->ofbGetPixelInformation},
+	};
+	static constexpr mach_vm_address_t requestOffsets[] = {
+		0x498BC,
+	};
+	routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size);
 }
 
 void Gen11::init() {
@@ -830,6 +895,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// alongside pinfo 1/1/1 if pursuing FB-count-reduction direction.
 			//{"__ZN21AppleIntelFramebuffer5startEP9IOService", wrapAppleIntelFramebufferStart, this->oAppleIntelFramebufferStart},
 			//{"__ZN21AppleIntelFramebuffer16enableControllerEv", wrapEnableController, this->oEnableController},
+			{"__ZN21AppleIntelFramebuffer14setDisplayModeEii", setDisplayMode, this->osetDisplayMode},
+			{"__ZN21AppleIntelFramebuffer18setupDisplayTimingEPK29IODetailedTimingInformationV2PS0_", setupDisplayTiming, this->osetupDisplayTiming},
 			//{"__ZN21AppleIntelDisplayPath24getFreeJoinablePathCountEv", wrapGetFreeJoinablePathCount, this->oGetFreeJoinablePathCount},
 			// Path B: Force aperture memory under dp0 mode to prevent WS=0x3 migration to
 			// non-aperture, which leaves the display scanning empty pages and triggers
@@ -879,6 +946,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x28D9E,
 			0x290BE,
 			0x42874,
+			0x4762C,
+			0x9CF24,
 			0x9E54E,
 			0x4AD5E,
 			0x89A36,
@@ -909,6 +978,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}();
 		routeAUXTransactionGuard(patcher, address, size);
 		routeEnhancedFraming(patcher, address, size);
+		routePixelInformation(patcher, address, size);
 
 		[&, this]() __attribute__((noinline)) {
 		if constexpr (isprod) {
@@ -1236,8 +1306,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f4c, r4c, arrsize(f4c),	2},
 		//		{activeKext, f6a, r6a, arrsize(f6a),	1},
 		//		{activeKext, f7, r7, arrsize(f7),	1},
-				// f10 ("hwreg" CALL+JZ→JMP bypass) commented out — NOT in NootedBlue.
-				{activeKext, f10, r10, arrsize(f10),	1},
 				// f13: mandatory. Without this port-probe bypass the spoofed TGL path freezes during boot.
 				{activeKext, f13, r13, arrsize(f13),	1},
 				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
@@ -2094,9 +2162,10 @@ void Gen11::setupPipeScaler(AppleIntel::AppleIntelScaler *that, AppleIntel::Appl
 				have_base    = true;
 				pre_gate1E3  = base[0x1E3];
 				pre_gate1E5  = base[0x1E5];
-				// Still try the gate clear — harmless if not the right gate.
+				if (!NGreen::callback->isRaptorLakeHX()) {
 				base[0x1E3]  = 0;
 				base[0x1E5]  = 0;
+				}
 			}
 		}
 	}
@@ -2150,31 +2219,9 @@ bool Gen11::paramsSurfCompare(AppleIntel::AppleIntelBaseController *that,
 	uint32_t nat_stride_pl2 = pl2 ? pl2->PLANE_STRIDE : 0;
 	uint32_t nat_surf_pl2   = pl2 ? pl2->PLANE_SURF   : 0;
 
-	if (!NGreen::callback->isRealTGL && pl2) {
-		pl2->PLANE_CTL    = (pl2->PLANE_CTL & ~(0x7u << 10));  // bits[12:10] = 000 → linear
-		pl2->PLANE_STRIDE = 0xa0;                               // 2560×4 / 64 = 160 = 0xa0
-	}
-
 	bool ret = FunctionCast(paramsSurfCompare, callback->oparamsSurfCompare)(that, p1, p2, pl1, pl2);
 
 	SYSLOG("ngreen", "V401, original ret [%d]", ret);
-	// ADL-P: the ICL/TGL driver's SURF-only fast-path (used when paramsSurfCompare returns
-	// false) does not work correctly under this spoof — PLANE_SURF never gets written on
-	// subsequent flips.  Force a full reprogram whenever the surface address actually changes.
-	if (!NGreen::callback->isRealTGL && !ret && pl1 && pl2) {
-		if (pl1->PLANE_SURF != pl2->PLANE_SURF)
-			ret = true;
-	}
-
-	// Real fix for seam scaler 2: Apple reads PIPE_SEAM_EXCESS and PS_PS_WIN_SZ from p2
-	// AFTER paramsSurfCompare returns, to fill the GPU DSB buffer entry for PS_WIN_SZ_2_A
-	// (0x68274). On a single-pipe ADL-P panel there is no seam scaler 2; if the DSB gets
-	// 0x3fff04f there, the pipeline aborts the flip immediately (param2=0 at V405).
-	// Zeroing here prevents any non-zero seam value from reaching the DSB.
-	if (!NGreen::callback->isRealTGL && p2 != nullptr) {
-		p2->PIPE_SEAM_EXCESS = 0;
-		p2->PS_PS_WIN_SZ     = 0;
-	}
 
 	if (NGreen::callback == nullptr || NGreen::callback->isRealTGL) return ret;
 
@@ -2205,7 +2252,7 @@ bool Gen11::paramsSurfCompare(AppleIntel::AppleIntelBaseController *that,
 		   v401Count, ret,
 		   old_ctl, old_tile, old_stride, old_surf, old_src,
 		   new_ctl, new_tile, new_stride, new_surf, new_src,
-		   nat_tile_pl1, nat_tile_pl2, nat_stride_pl1, nat_surf_pl1,
+		   nat_tile_pl1, nat_stride_pl1, nat_surf_pl1,
 		   nat_tile_pl2, nat_stride_pl2, nat_surf_pl2);
 
 	return ret;
@@ -2370,20 +2417,6 @@ void Gen11::configureColorPipeLine(AppleIntel::AppleIntelPlane *that, AppleIntel
 		pre_misc  = NGreen::callback->readReg32(0x70030);  // PIPE_MISC  Pipe A
 		if (flipArgs != nullptr)
 			sel = static_cast<uint8_t>(*reinterpret_cast<const uint32_t *>(&flipArgs->flt_001C) >> 24);
-
-		// DIAG: log the color pipeline bitmask (FB+0x4248) to identify which bit drives PIPE_MISC bit 23.
-		// The bitmask at FB+0x4248 (FB = *(that+0x68)) selects which sub-functions run inside
-		// configureColorPipeLine. Bit 10 = configurePipeHDRMode candidate. Log pre/post to verify.
-		if (that != nullptr) {
-			void *fb = getMember<void *>(that, 0x68);
-			if (fb != nullptr) {
-				uint32_t bm_before = getMember<uint32_t>(fb, 0x4248);
-				getMember<uint32_t>(fb, 0x4248) &= ~(1u << 10);
-				uint32_t bm_after  = getMember<uint32_t>(fb, 0x4248);
-				SYSLOG("ngreen", "DIAG[BM]: fb=%p bitmask 0x%08x→0x%08x param2=%d",
-				       fb, bm_before, bm_after, (int)param_2);
-			}
-		}
 	}
 
 	FunctionCast(configureColorPipeLine, callback->oConfigureColorPipeLine)(that, flipArgs, param_2);
@@ -2431,13 +2464,13 @@ void Gen11::configureColorPipeLine(AppleIntel::AppleIntelPlane *that, AppleIntel
 // ============================================================================
 
 // ✓ APPROACH 1: PRE-CALL TILING PATCH (origin-level, Apple's natural path)
-#define V406_APPROACH_TILING_PATCH 1
+// #define V406_APPROACH_TILING_PATCH 1
 
 // Alternative approaches below (comment out APPROACH 1 if trying these):
 // #define V406_APPROACH_POST_SHADOW_PATCH 1      // Post-call shadow field write
 // #define V406_APPROACH_STRIDE_DIVISOR 1          // Stride divisor manipulation
 // #define V406_APPROACH_DUAL_TILING_STRIDE 1      // Tiling + stride combined
-// #define V406_APPROACH_DIAGNOSTIC_ONLY 1         // Pass-through with logging
+#define V406_APPROACH_DIAGNOSTIC_ONLY 1         // Pass-through with logging
 
 // ============================================================================
 // === TILING ENUM SELECTOR (active for approaches using pre-call patch) ===
@@ -3032,6 +3065,8 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
 
+	if (that != nullptr) gAuxSeen = true;
+
 	// V97AUX: log first ~40 AUX reads to diagnose eDP link training failures.
 	static int auxLogCount = 0;
 	if (auxLogCount < 40) {
@@ -3384,6 +3419,13 @@ void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, b
 	FunctionCast(hwSetPowerWellStateDDI, callback->ohwSetPowerWellStateDDI)(that,param_1,param_2);
 }
 
+static constexpr uint32_t kDePipeAImr = 0x44404u;
+static constexpr uint32_t kGen8PipeFifoUnderrun = 0x80000000u;
+
+static uint32_t fixPipeAImr(uint32_t val) {
+	return IS_RAPTOR_LAKE_HX() ? val & ~kGen8PipeFifoUnderrun : val;
+}
+
 void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsigned long param_1, uint32_t param_2)
 {
 	if (NGreen::callback && NGreen::callback->dmcDisabled &&
@@ -3439,6 +3481,9 @@ void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsi
 			SYSLOG("ngreen", "V99F[Cp%d]: PLANE_CTL 0x%x passthrough tiling=%d (V99F[C] hack removed)",
 				   v99FCpCount, param_2, tiling);
 		}
+	}
+	if ((param_1 & 0xFFFFF) == kDePipeAImr) {
+		param_2 = fixPipeAImr(param_2);
 	}
 	// V103F removed (was: FastWriteRegister32 twin of V103 — block DC_STATE_EN
 	// non-zero writes). Pair-mate to V103/V103P; all three sites now passthrough.
@@ -3604,6 +3649,9 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				   v99CPassCount, param_2, tiling);
 		}
 	}
+	if ((param_1 & 0xFFFFF) == kDePipeAImr) {
+		param_2 = fixPipeAImr(param_2);
+	}
 
 	// V97 removed (was: clear bit[16] PORT_SYNC_MODE_MASTER_SELECT[0] from
 	// TRANS_DDI_FUNC_CTL_A on !isRealTGL — Apple's SetupParams sets it but UEFI GOP
@@ -3717,6 +3765,8 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 					   R(0x68180), R(0x68170), R(0x68174), R(0x68188), R(0x68194));
 				// DDI buf / port
 				#undef R
+				scanoutSnapshot(false);
+				scanoutArmLate();
 			}
 		}
 		/*.  ------ MAN IN THE MIDDLE CHIP HACK -------
@@ -3874,9 +3924,7 @@ void Gen11::initPlatformWorkarounds(AppleIntel::AppleIntelBaseController *that)
 	// Apple's TGL kext targets Display 12 and doesn't apply these chicken bits / clock-
 	// gating / error masks on the spoofed setup. Linux marks them as REQUIRED for
 	// Display 13+; their absence can manifest as display engine misbehavior
-	// (timing/underrun/error-recovery loops). Gated by !isRealTGL so genuine TGL HW
-	// (Display 12) is unaffected.
-	if (NGreen::callback && !NGreen::callback->isRealTGL) {
+	if (NGreen::callback && !NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX()) {
 		// Wa_22011091694:adlp — DPCE_GATING_DIS = REG_BIT(17) in GEN9_CLKGATE_DIS_5 (0x46540)
 		NGreen::callback->intel_de_rmw(0x46540, 0, 1u << 17);
 
@@ -4632,7 +4680,7 @@ uint8_t Gen11::hwRegsNeedUpdate
 		NGreen::callback->adlpDcExit("hwRNU");
 
 	// param_3 is the pending CRTCParams built by SetupParams.
-	if (!NGreen::callback->isRealTGL && param_3) {
+	if (!NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX() && param_3) {
 		auto *params = param_3;
 
 		// V97P: clear bit[16] in TRANS_DDI_FUNC_CTL.
@@ -10110,6 +10158,45 @@ int Gen11::wrapEnableController(void *that)
 	return ret;
 }
 
+IOReturn Gen11::fbGetPixelInformation(void *that, int mode, int depth, int aperture,
+	IOPixelInformation *info)
+{
+	IOReturn result = FunctionCast(fbGetPixelInformation, callback->ofbGetPixelInformation)(
+		that, mode, depth, aperture, info);
+	static constexpr IODisplayModeID kNativeModeId = static_cast<IODisplayModeID>(0x80001000);
+	if (static_cast<IODisplayModeID>(mode) == kIODisplayModeIDBootProgrammable && result != kIOReturnSuccess) {
+		IOReturn retry = kIOReturnSuccess;
+		uint32_t w = 0, h = 0;
+		if (info != nullptr) {
+			retry = FunctionCast(fbGetPixelInformation, callback->ofbGetPixelInformation)(
+				that, static_cast<int>(kNativeModeId), depth, aperture, info);
+			if (retry == kIOReturnSuccess) {
+				result = kIOReturnSuccess;
+			} else if (depth == 0 && callback != nullptr) {
+				const uint32_t src = NGreen::callback ? NGreen::callback->readReg32(0x6001C) : 0;
+				w = ((src >> 16) & 0x1FFFu) + 1u;
+				h = (src & 0x1FFFu) + 1u;
+				if (src != 0 && w >= 640u && w <= 8192u && h >= 480u && h <= 8192u) {
+					bzero(info, sizeof(*info));
+					info->bytesPerRow       = w * 4u;
+					info->bitsPerPixel      = 32;
+					info->pixelType         = kIORGBDirectPixels;
+					info->componentCount    = 3;
+					info->bitsPerComponent  = 8;
+					info->componentMasks[0] = 0x00FF0000u;
+					info->componentMasks[1] = 0x0000FF00u;
+					info->componentMasks[2] = 0x000000FFu;
+					strlcpy(info->pixelFormat, IO32BitDirectPixels, sizeof(info->pixelFormat));
+					info->activeWidth       = w;
+					info->activeHeight      = h;
+					result = kIOReturnSuccess;
+				}
+			}
+		}
+	}
+	return result;
+}
+
 bool Gen11::wrapAppleIntelFramebufferStart(void *that, void *provider)
 {
 	uint32_t fbId = getMember<uint32_t>(that, 0x1DC);
@@ -10320,8 +10407,6 @@ uint8_t Gen11::validateDisplayMode(void *that, int param_1,void *param_2, void *
 
 void Gen11::setupDisplayTiming (void *that,void *param_1,
                          void *param_2){
-    auto displayTimingInfo = const_cast<IODetailedTimingInformationV2 *>(reinterpret_cast<const IODetailedTimingInformationV2 *>(param_2));
-    if (displayTimingInfo!=nullptr) displayTimingInfo->pixelClock = 785400000;
 	FunctionCast(setupDisplayTiming, callback->osetupDisplayTiming)(that,param_1,param_2);
     //auto ret= FunctionCast(setupDisplayTiming, callback->osetupDisplayTiming)(that,param_1,param_2);
     //return ret;
@@ -10354,9 +10439,8 @@ uint8_t Gen11::enableController(AppleIntel::AppleIntelFramebuffer *that)
 }
 
 
-uint8_t Gen11::setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2)
+int Gen11::setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2)
 {
-	if (getMember<uint32_t>(that, 0x1dc)==0) getMember<uint8_t>(that, 0x1e0)=1;
 	return FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
 
 }
@@ -10373,7 +10457,7 @@ unsigned long  Gen11::allocateDisplayResources(void *that)
 {
 	auto ret=FunctionCast(allocateDisplayResources, callback->oallocateDisplayResources)(that);
 
-	if (!NGreen::callback->isRealTGL) {
+	if (!NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX()) {
 		// ADL-P / RPL-P / RPL-U (XE_LPD, Display v13).
 		// ADL-P IS XE_LPD — same display engine, same register layout.
 		// Apple's TGL driver (AppleIntelTGLGraphicsFramebuffer) does not program this
@@ -10636,7 +10720,7 @@ int Gen11::hwSetMode
 	// original hwSetMode reads TRANS_DDI_FUNC_CTL_A and compares it with the target 0x8A010102
 	// (2-lane DP SST). Write the correct value NOW so paramsFbCompare sees no lane-count change
 	// needed and leaves DDI_BUF_CTL_A alone — preserving the UEFI-trained 4-lane eDP link.
-	if (!NGreen::callback->isRealTGL) {
+	if (!NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX()) {
 		NGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A
 		DBGLOG("ngreen", "hwSetMode: pre-write TRANS_DDI_FUNC_CTL_A=0x8A000106 to prevent paramsFbCompare lane reprog");
 	}
