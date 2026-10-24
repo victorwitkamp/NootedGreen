@@ -59,6 +59,80 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 
 Gen11 *Gen11::callback = nullptr;
 
+static bool isExpectedTGLDebugFramebuffer(mach_vm_address_t address, size_t size) {
+	struct Anchor {
+		mach_vm_address_t offset;
+		const uint8_t *bytes;
+		size_t length;
+	};
+
+	static const uint8_t controllerStart[] =
+		{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};
+	static const uint8_t getOSInformation[] =
+		{0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x10, 0x49};
+	static const uint8_t scalerInit[] =
+		{0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x30};
+	static const Anchor anchors[] = {
+		{0x5A8A0, controllerStart, arrsize(controllerStart)},
+		{0x5D1A0, getOSInformation, arrsize(getOSInformation)},
+		{0x98C48, scalerInit, arrsize(scalerInit)},
+	};
+
+	for (const auto &anchor : anchors) {
+		if (anchor.offset > size || anchor.length > size - anchor.offset || memcmp(reinterpret_cast<const void *>(address + anchor.offset),
+				anchor.bytes, anchor.length) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static mach_vm_address_t gTGLFbBase = 0;
+
+static bool isKnownTGLImage(mach_vm_address_t address, size_t size) {
+	static const uint8_t kKnown[][16] = {
+		{0xb9, 0x6a, 0x84, 0x48, 0x9d, 0x17, 0x3f, 0x78, 0xb7, 0x6d, 0x15, 0xa0, 0xb3, 0x59, 0xa9, 0xa0},
+		{0xba, 0x3a, 0xa1, 0xc0, 0xfe, 0x6b, 0x33, 0xb3, 0x9d, 0x85, 0x73, 0xf8, 0x48, 0x39, 0x4e, 0x3d},
+	};
+	if (address == 0 || size < sizeof(mach_header_64)) return false;
+	const auto *mh = reinterpret_cast<const mach_header_64 *>(address);
+	if (mh->magic != MH_MAGIC_64 || sizeof(*mh) + mh->sizeofcmds > size) return false;
+	const auto *lc = reinterpret_cast<const uint8_t *>(mh + 1), *end = lc + mh->sizeofcmds;
+	for (uint32_t i = 0; i < mh->ncmds && lc + sizeof(load_command) <= end; i++) {
+		const auto *cmd = reinterpret_cast<const load_command *>(lc);
+		if (cmd->cmdsize < sizeof(load_command) || lc + cmd->cmdsize > end) return false;
+		if (cmd->cmd == LC_UUID && cmd->cmdsize >= sizeof(uuid_command)) {
+			const auto *u = reinterpret_cast<const uuid_command *>(lc);
+			for (uint32_t j = 0; j < arrsize(kKnown); j++)
+				if (memcmp(u->uuid, kKnown[j], sizeof(kKnown[j])) == 0) return true;
+			return false;
+		}
+		lc += cmd->cmdsize;
+	}
+	return false;
+}
+
+template <size_t N>
+static bool routeTGLDebugOffsets(KernelPatcher &patcher, RouteRequestPlus (&requests)[N],
+	const mach_vm_address_t (&offsets)[N], mach_vm_address_t address, size_t size) {
+	if (!isKnownTGLImage(address, size)) return false;
+	for (size_t i = 0; i < N; i++) {
+		if (offsets[i] >= size) return false;
+		const auto from = address + offsets[i];
+		patcher.eraseCoverageInstPrefix(from, 5, 14);
+		const bool needsWrapper = requests[i].org != nullptr;
+		auto original = patcher.routeFunction(from, requests[i].to, needsWrapper);
+		if (patcher.getError() != KernelPatcher::Error::NoError || (needsWrapper && original == 0)) {
+			patcher.clearError();
+			return false;
+		}
+
+		if (needsWrapper)
+			*requests[i].org = original;
+	}
+	return true;
+}
+
 void Gen11::init() {
 	callback = this;
 
@@ -425,16 +499,18 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		
 		
 	}	else if (kextG11FBT.loadIndex == index || kextG11FBTA.loadIndex == index) {
+		return [&, this]() __attribute__((noinline)) -> bool {
 		this->tglFBLoaded = true;
 		auto *activeKext = (kextG11FBTA.loadIndex == index) ? &kextG11FBTA : &kextG11FBT;
 		NGreen::callback->setRMMIOIfNecessary();
 		SYSLOG("ngreen", "init AppleIntelTGLGraphicsFramebuffer");
 		
-		bool isprod=false;
-		auto prod=patcher.solveSymbol(index, "__ZN24AppleIntelBaseController5startEP9IOService", address, size);
-		if (!prod) isprod=true;
+		if (!isExpectedTGLDebugFramebuffer(address, size)) {
+			return false;
+		}
+		constexpr bool isprod = false;
 		
-		if (isprod) {
+		if constexpr (isprod) {
 			
 			SolveRequestPlus solveRequests[] = {
 				{"__ZN31AppleIntelFramebufferController19setCDClockFrequencyEy", this->orgSetCDClockFrequency},
@@ -444,14 +520,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 		else
 		{
-			SolveRequestPlus solveRequests[] = {
-				{"__ZN24AppleIntelBaseController19setCDClockFrequencyEy", this->orgSetCDClockFrequency},
-				{"_gPlatformInformationList", this->gPlatformInformationList},
-			};
-			PANIC_COND(!SolveRequestPlus::solveAll(patcher, index, solveRequests, address, size), "ngreen",	"Failed to resolve symbols");
+			constexpr mach_vm_address_t setCDClockFrequencyOffset = 0xA41E0;
+			constexpr mach_vm_address_t platformInformationListOffset = 0x1C2FA0;
+			PANIC_COND(setCDClockFrequencyOffset >= size || platformInformationListOffset >= size,
+				"ngreen", "TGL fixed symbols are outside the loaded image");
+			this->orgSetCDClockFrequency = reinterpret_cast<decltype(this->orgSetCDClockFrequency)>(
+				address + setCDClockFrequencyOffset);
+			this->gPlatformInformationList = address + platformInformationListOffset;
 			
 		}
 
+		[&, this]() __attribute__((noinline)) {
 		RouteRequestPlus requests[] = {
 			// ...existing routes...
 			//{"__ZN24AppleIntelBaseController17registerWithAICPMEPv", alwaysReturnSuccess, this->oalwaysReturnSuccess},
@@ -513,6 +592,31 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN16AppleIntelScaler19updateRegisterCacheEv",AppleIntelScalerupdateRegisterCache, this->oAppleIntelScalerupdateRegisterCache},
 			{"__ZN19AppleIntelPowerWell20disableDisplayEngineEv",disableDisplayEngine, this->odisableDisplayEngine},
 			{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv",enableDisplayEngine, this->oenableDisplayEngine},
+		};
+		static constexpr mach_vm_address_t requestOffsets[] = {
+			0x98C48,
+			0x03758,
+			0x98F8C,
+			0x03B5A,
+			0x99112,
+			0x99388,
+			0x73FA2,
+			0x3189E,
+			0x72528,
+			0x731F8,
+			0x06DA8,
+			0x0511E,
+			0x092D6,
+			0x9A73C,
+			0x8A3F2,
+			0x881EC,
+		};
+		PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
+			"ngreen", "Failed to route TGL debug common offsets batch 1");
+		}();
+
+		[&, this]() __attribute__((noinline)) {
+		RouteRequestPlus requests[] = {
 			// V35: Removed ComboPhyEv hook — causes MCE on RPL/ADL. Firmware calibration sufficient.
 			{"__ZN14AppleIntelPort16computeLaneCountEPK29IODetailedTimingInformationV2jjPj",computeLaneCount, this->ocomputeLaneCount},
 			{"__ZN14AppleIntelPort21setupOptimalLaneCountEPK29IODetailedTimingInformationV2j",setupOptimalLaneCount, this->osetupOptimalLaneCount},
@@ -552,9 +656,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",   prepareToExitWake,   this->oprepareToExitWake},
 			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",  prepareToEnterWake,  this->oprepareToEnterWake},
 			{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
-			{"__ZN21AppleIntelFramebuffer18prepareToExitSleepEv",  prepareToExitSleep,  this->oprepareToExitSleep},
-			{"__ZN21AppleIntelFramebuffer19prepareToEnterSleepEv", prepareToEnterSleep, this->oprepareToEnterSleep},
-			{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
 			// Keep native SST timing setup; forcing custom clocks can break CoreDisplay validation.
 			//{"__ZN24AppleIntelBaseController17SetupDPSSTTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParams", SetupDPSSTTimings, this->oSetupDPSSTTimings},
 			//{"__ZN24AppleIntelBaseController12SetupTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2P10CRTCParams", SetupTimings, this->oSetupTimings},
@@ -570,9 +671,40 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			//{"__ZN20IntelFBClientControl24vendor_doDeviceAttributeEjPmmS0_S0_P25IOExternalMethodArguments", releaseDoorbell},
 			//{"__ZN21AppleIntelFramebuffer16enableControllerEv", isPanelPowerOn},
 		};
-		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
+		static constexpr mach_vm_address_t requestOffsets[] = {
+			0x2F032,
+			0x2EEBE,
+			0x28D9E,
+			0x42874,
+			0x9E54E,
+			0x4AD5E,
+			0x89A36,
+			0x8B7DC,
+			0x8AD3A,
+			0x8DFB2,
+			0x8DCE6,
+			0x8DE14,
+			0x3788C,
+			0x383A8,
+			0x76DB6,
+		};
+		gTGLFbBase = isKnownTGLImage(address, size) ? address : 0;
+		PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
+			"ngreen", "Failed to route TGL debug common offsets batch 2");
+		}();
 		
-		if (isprod) {
+		[&, this]() __attribute__((noinline)) {
+			RouteRequestPlus sleepRoutes[] = {
+				{"__ZN21AppleIntelFramebuffer18prepareToExitSleepEv", prepareToExitSleep, this->oprepareToExitSleep},
+				{"__ZN21AppleIntelFramebuffer19prepareToEnterSleepEv", prepareToEnterSleep, this->oprepareToEnterSleep},
+			};
+			static constexpr mach_vm_address_t sleepOffsets[] = {0x396AE, 0x37E44};
+			PANIC_COND(!routeTGLDebugOffsets(patcher, sleepRoutes, sleepOffsets, address, size),
+				"ngreen", "Failed to route TGL debug sleep offsets");
+		}();
+
+		[&, this]() __attribute__((noinline)) {
+		if constexpr (isprod) {
 			RouteRequestPlus requests[] = {
 				{"__ZN21AppleIntelFramebuffer4initEP31AppleIntelFramebufferControllerj",AppleIntelFramebufferinit, this->oAppleIntelFramebufferinit},
 				{"__ZN31AppleIntelFramebufferController23initPlatformWorkaroundsEv", initPlatformWorkarounds, this->oinitPlatformWorkarounds},
@@ -610,9 +742,27 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				// detect what fills it (zeros vs wallpaper pixels). FB-only scope.
 				{"__ZN24AppleIntelBaseController13hwSetupMemoryEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsb", wrapHwSetupMemory, this->ohwSetupMemory},
 			};
-			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route d symbols");
+			static constexpr mach_vm_address_t requestOffsets[] = {
+				0x3CFE8,
+				0x60502,
+				0x5D1A0,
+				0x773D0,
+				0x5F7E2,
+				0x65DA2,
+				0x867C8,
+				0x5A8A0,
+				0xA4F90,
+				0xA5192,
+				0xA45B8,
+				0xA4D46,
+				0x732DC,
+				0x6DF9E,
+			};
+			PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
+				"ngreen", "Failed to route TGL debug controller offsets");
 			
 		}
+		}();
 		
 		//powerwell
 		static const uint8_t f1[]= {0xe8, 0x99, 0x9f, 0xfd, 0xff, 0x89, 0x45, 0xc8, 0x3d, 0xff, 0xff, 0x00, 0x00, 0x74, 0x78};
@@ -792,7 +942,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t r_tcon_banksia[] = {0x3d, 0x14, 0x1e, 0xc4, 0xc1};
 		const bool enableTcon = checkKernelArgument("-ngreentglwithgfx");
 
-		if (isprod){
+		if constexpr (isprod) {
 			LookupPatchPlus const patchesp[] = {// tgl production kext
 
 				// f1p (powerwell JZ→JMP) commented out — not present in NootedBlue's
@@ -896,6 +1046,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		
 		return true;
 		
+		}();
 	}else if (kextG11HW.loadIndex == index) {
 		if (this->tglHWLoaded) {
 			DBGLOG("ngreen", "Skipping ICL HW — TGL HW already loaded");
@@ -1003,6 +1154,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		return true;
 
 	} else if (kextG11HWT.loadIndex == index || kextG11HWTA.loadIndex == index) {
+		return [&, this]() __attribute__((noinline)) -> bool {
 		this->tglHWLoaded = true;
 		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
@@ -1025,6 +1177,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		const bool wegCoexist = isWEGCoexistMode();
 		const bool forceFullMTL = shouldForceFullMetalPath();
 
+		[&, this]() __attribute__((noinline)) {
 		RouteRequestPlus requests[] = {
 			
 			 {"__ZN16IntelAccelerator20_PAVPCommandCallbackEP8OSObject22PAVPSessionCommandID_tjPj", wrapPavpSessionCallback, this->orgPavpSessionCallback},
@@ -1145,6 +1298,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		SYSLOG("ngreen", "V165: routing %zu HW accelerator symbols", sizeof(requests)/sizeof(requests[0]));
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
+		}();
 
 		{
 			RouteRequestPlus startRoute[] = {
@@ -1391,6 +1545,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t r_v140_case4_store20[] = {
 			0x0f, 0xc6, 0xcc, 0xc6, 0x41, 0x0f, 0x11, 0x49, 0x20, 0x0f, 0xc6, 0xdc, 0x4e
 		};
+		[&]() __attribute__((noinline)) {
 
 		{
 			// V52: Split patches into always-apply and RPL-only groups.
@@ -1603,12 +1758,14 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "V52: Real TGL — skipping topology hardcodes and BCS bypass");
 			}
 		}
+		}();
 
 		SYSLOG("ngreen", "Loaded AppleIntelTGLGraphics! %s",
 			   NGreen::callback->isRealTGL ? "Real TGL — native topology" :
 			   "RPL spoofed — slices=1 subslices=4(2DSS) maxEU/SS=8 totalEU=32 L3=4");
 
 		return true;
+		}();
 	}
 
     return false;
