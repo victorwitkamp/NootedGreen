@@ -32,12 +32,12 @@ static const char *pathsTGLFB[] = {
     "/Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext/Contents/MacOS/AppleIntelTGLGraphicsFramebuffer",
 };
 static KernelPatcher::KextInfo kextG11FBT {"com.xxxxx.driver.AppleIntelTGLGraphicsFramebuffer", pathsTGLFB, 1,
-    {false, false, false, true}, {},
+    {true, false, false, false, true}, {},
     KernelPatcher::KextInfo::Unloaded};
 
 // TGL FB — com.apple (loaded from /Library/Extensions/)
 static KernelPatcher::KextInfo kextG11FBTA {"com.apple.driver.AppleIntelTGLGraphicsFramebuffer", pathsTGLFB, 1,
-	{false, false, false, true}, {},
+	{true, false, false, false, true}, {},
 	KernelPatcher::KextInfo::Unloaded};
 
 // TGL HW — com.xxxxx (loaded from /Library/Extensions/)
@@ -45,12 +45,12 @@ static const char *pathsTGLHW[] = {
     "/Library/Extensions/AppleIntelTGLGraphics.kext/Contents/MacOS/AppleIntelTGLGraphics",
 };
 static KernelPatcher::KextInfo kextG11HWT {"com.xxxxx.driver.AppleIntelTGLGraphics", pathsTGLHW, 1,
-    {false, false, false, true}, {},
+    {true, false, false, false, true}, {},
     KernelPatcher::KextInfo::Unloaded};
 
 // TGL HW — com.apple (loaded from /Library/Extensions/)
 static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraphics", pathsTGLHW, 1,
-	{false, false, false, true}, {},
+	{true, false, false, false, true}, {},
 	KernelPatcher::KextInfo::Unloaded};
 
 // IOAcceleratorFamily2 symbols are resolved inside NGreen::processKext via
@@ -551,6 +551,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// Apple's implementations are known to corrupt WS state on RPL/ADL on resume.
 			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",   prepareToExitWake,   this->oprepareToExitWake},
 			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",  prepareToEnterWake,  this->oprepareToEnterWake},
+			{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
 			{"__ZN21AppleIntelFramebuffer18prepareToExitSleepEv",  prepareToExitSleep,  this->oprepareToExitSleep},
 			{"__ZN21AppleIntelFramebuffer19prepareToEnterSleepEv", prepareToEnterSleep, this->oprepareToEnterSleep},
 			{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
@@ -1221,17 +1222,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		
 		// L3BankCount bypass (verified @ 0x28776 in LE binary)
 		// Original: topology-gated conditionals (cmp slices/eu/threads) → only set L3BankCount=8 for a specific config.
-		// Patch:    NOP all conditional branches → always store L3BankCount=8 @ IGAccelDevice+0x1164.
+		// Patch:    NOP all conditional branches → always store L3BankCount=4 @ IGAccelDevice+0x1164.
 		static const uint8_t f3b[] = {// jmp L3BankCount
 			0x74, 0x23, 0x83, 0xf9, 0x02, 0x0f, 0x85, 0x89, 0x01, 0x00, 0x00, 0x83, 0xfe, 0x01, 0x75, 0x59, 0x83, 0xfa, 0x0c, 0x75, 0x54, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
 		static const uint8_t r3b[] = {
-			0x90, 0x90, 0x83, 0xf9, 0x02, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x83, 0xfe, 0x01, 0x90, 0x90, 0x83, 0xfa, 0x0c, 0x90, 0x90, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
+			0x90, 0x90, 0x83, 0xf9, 0x02, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x83, 0xfe, 0x01, 0x90, 0x90, 0x83, 0xfa, 0x0c, 0x90, 0x90, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00
 		};
 		
 		// MaxEUPerSubSlice override (verified @ 0x28692 in LE binary)
 		// Original: MaxEUPerSubSlice = 8 - popcount(EUDisableFuse)  → stores result at IGAccelDevice+0x116c
-		// Patch:    hardcodes MaxEUPerSubSlice=8 for RPL 96EU (8 EU per traditional sub-slice).
+		// Patch:    hardcodes MaxEUPerSubSlice=8 (8 EU per traditional sub-slice).
 		//           TGL binary counts sub-slices (SS), not dual sub-slices (DSS).
 		//           Linux shows 16 EU/DSS = 8 EU/SS since each DSS has 2 SS.
 		static const uint8_t f3bb[] = {//MaxEUPerSubSlice
@@ -1244,13 +1245,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		// NumSubSlices override (verified @ 0x28654 in LE binary)
 		// Original: mov ebx,[rbp-0x30]; popcnt esi,ebx; add esi,esi; mov [r15+0x1158],esi
 		//           → NumSubSlices = popcount(subsliceMask) * 2  (hardware-detected)
-		// Patch:    hardcodes NumSubSlices=12 for RPL 96EU (6 DSS × 2 SS/DSS = 12 SS).
-		//           Linux i915: subslice total=6 mask=0x3f, so 6 DSS doubled to 12 SS.
+		// Patch:    hardcodes NumSubSlices=4 (2 DSS × 2 SS/DSS).
 		static const uint8_t f3bbb[] = {//NumSubSlices
 			0x8b, 0x5d, 0xd0, 0xf3, 0x0f, 0xb8, 0xf3, 0x01, 0xf6, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
 		static const uint8_t r3bbb[] = {
-			0x8b, 0x5d, 0xd0, 0xbe, 0x0c, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
+			0x8b, 0x5d, 0xd0, 0xbe, 0x04, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
 		
 		// GPU caps override (disabled) – would change MaxSlices 6→5, SARation 2→1, MaxEU/SS 6→5.
@@ -1406,9 +1406,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			if (!NGreen::callback->isRealTGL) {
 				// RPL-only: hardcode topology and bypass BCS readiness check
 				LookupPatchPlus const patchesRPL[] = {
-					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=8
+					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=4
 					{activeKext, f3bb, r3bb, arrsize(f3bb),	1},    // MaxEU/SS=8
-					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=12
+					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=4
 					{activeKext, f_devstart, m_devstart, r_devstart, rm_devstart, arrsize(f_devstart), 1}, // BCS bypass
 				};
 				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
@@ -1606,7 +1606,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 		SYSLOG("ngreen", "Loaded AppleIntelTGLGraphics! %s",
 			   NGreen::callback->isRealTGL ? "Real TGL — native topology" :
-			   "RPL spoofed — slices=1 subslices=12(6DSS) maxEU/SS=8 totalEU=96 L3=8");
+			   "RPL spoofed — slices=1 subslices=4(2DSS) maxEU/SS=8 totalEU=32 L3=4");
 
 		return true;
 	}
@@ -3117,7 +3117,7 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
 		pinfo[1].fInfoFramebufferCount = 3;
 		pinfo[1].fSliceCount  = 1;
 		pinfo[1].fmaxEuCount  = 8;
-		pinfo[1].fsubslices   = 10;
+		pinfo[1].fsubslices   = 4;
 
 		// Connector 0: built-in eDP (LVDS), DDI-A, pipe 0
 		pinfo[1].connectors[0].index = 0;
@@ -4947,10 +4947,9 @@ void Gen11::getGPUInfo(void *that)
 	
 	FunctionCast(getGPUInfo, callback->ogetGPUInfo)(that);
 
-	// --- GPU topology override for RPL i7-13700H (verified from Linux i915 syslog) ---
-	// Linux i915 reports: 1 slice, 6 DSS (mask=0x3f), 16 EU/DSS, 96 EU total.
+	// --- GPU topology override for the Raptor Lake-HX iGPU: 1 slice, 2 DSS, 16 EU/DSS, 32 EU total ---
 	// TGL binary uses traditional sub-slices (SS), not dual sub-slices (DSS):
-	//   6 DSS × 2 SS/DSS = 12 SS,  16 EU/DSS / 2 = 8 EU/SS, 12 × 8 = 96 EU.
+	//   2 DSS × 2 SS/DSS = 4 SS,  16 EU/DSS / 2 = 8 EU/SS, 4 × 8 = 32 EU.
 	// Object layout (byte offsets from `this`, verified via disassembly):
 	//   0x115c = NumSlices          0x0dd8 = NumSlices mirror
 	//   0x1158 = NumSubSlices       0x0ddc = NumSubSlices mirror
@@ -4959,9 +4958,9 @@ void Gen11::getGPUInfo(void *that)
 	//   0x1150 = Frequency pair (low32=fMaxMHz, high32=fMinMHz)
 	//   0x1164 = L3BankCount
 	unsigned int numSlices        = 1;
-	unsigned int numSubSlices     = 12;  // 6 DSS × 2 = 12 traditional SS
+	unsigned int numSubSlices     = 4;
 	unsigned int maxEUPerSubSlice = 8;   // 16 EU/DSS ÷ 2 SS/DSS = 8 EU/SS
-	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices; // = 96
+	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices;
 	
 	getMember<UInt32>(that, 0x115c) = numSlices;
 	getMember<UInt32>(that, 0x1158) = numSubSlices;
@@ -4969,13 +4968,11 @@ void Gen11::getGPUInfo(void *that)
 	getMember<UInt32>(that, 0x1124) = totalEU;
 	getMember<UInt32>(that, 0x0dd8) = numSlices;
 	getMember<UInt32>(that, 0x0ddc) = numSubSlices;
-	getMember<UInt32>(that, 0x1164) = 8;  // L3BankCount (confirmed from InsanelyMac TGL logs)
+	getMember<UInt32>(that, 0x1164) = 4;
 	
 	// Frequency: fMaxFrequencyInMhz=1000, fMinFrequencyInMhz=450 (TGL defaults)
 	getMember<uint64_t>(that, 0x1150) = 0x1C2000003E8ULL;
 	
-	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=8",
-		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
 
 }
 
@@ -9330,6 +9327,9 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	auto *mc  = OSString::withCString("IOAccelerator");
 	auto *pv  = OSString::withCString("IOPCIDevice");
 	auto *pcm = OSString::withCString("0x03000000&0xff000000");
+	auto *primaryMatch = useTglNames
+		? OSString::withCString("0xff208086 0x9a498086 0xa7888086")
+		: nullptr;
 	auto *ps  = OSNumber::withNumber(static_cast<unsigned long long>(1000), 32);
 
 	dict->setObject("CFBundleIdentifier", bi);
@@ -9337,6 +9337,8 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	dict->setObject("IOMatchCategory", mc);
 	dict->setObject("IOProviderClass", pv);
 	dict->setObject("IOPCIClassMatch", pcm);
+	if (primaryMatch)
+		dict->setObject("IOPCIPrimaryMatch", primaryMatch);
 	dict->setObject("IOProbeScore", ps);
 
 	OSSafeReleaseNULL(bi);
@@ -9344,6 +9346,7 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	OSSafeReleaseNULL(mc);
 	OSSafeReleaseNULL(pv);
 	OSSafeReleaseNULL(pcm);
+	OSSafeReleaseNULL(primaryMatch);
 	OSSafeReleaseNULL(ps);
 
 	// V44: GPU driver bundle names — required by IOAcceleratorFamily2 and WindowServer
@@ -9403,7 +9406,7 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	if (array) {
 		array->setObject(dict);
 		if (gIOCatalogue) {
-			bool ok = gIOCatalogue->addDrivers(array, true);
+			bool ok = gIOCatalogue->addDrivers(array, false);
 			SYSLOG("ngreen", "injectAcceleratorPersonality: addDrivers returned %d", ok);
 			this->acceleratorPersonalityInjected = ok;
 		} else {
