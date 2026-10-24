@@ -89,6 +89,8 @@ static bool isExpectedTGLDebugFramebuffer(mach_vm_address_t address, size_t size
 
 static mach_vm_address_t gTGLFbBase = 0;
 
+static bool ensureA788DisplayAWells(bool requireDDI = true);
+
 static bool isKnownTGLImage(mach_vm_address_t address, size_t size) {
 	static const uint8_t kKnown[][16] = {
 		{0xb9, 0x6a, 0x84, 0x48, 0x9d, 0x17, 0x3f, 0x78, 0xb7, 0x6d, 0x15, 0xa0, 0xb3, 0x59, 0xa9, 0xa0},
@@ -131,6 +133,17 @@ static bool routeTGLDebugOffsets(KernelPatcher &patcher, RouteRequestPlus (&requ
 			*requests[i].org = original;
 	}
 	return true;
+}
+
+void Gen11::routeAUXTransactionGuard(KernelPatcher &patcher, mach_vm_address_t address, size_t size) {
+	RouteRequestPlus requests[] = {
+		{"__ZN17AppleIntelPortHAL13runAUXCommandEN14AppleIntelPort11AUX_CommandEPjjb", wrapRunAUXCommand, callback->orgRunAUXCommand},
+	};
+	static constexpr mach_vm_address_t requestOffsets[] = {
+		0x91B64,
+	};
+	PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
+		"ngreen", "Failed to route TGL AUX transaction guard");
 }
 
 void Gen11::init() {
@@ -655,7 +668,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// Apple's implementations are known to corrupt WS state on RPL/ADL on resume.
 			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",   prepareToExitWake,   this->oprepareToExitWake},
 			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",  prepareToEnterWake,  this->oprepareToEnterWake},
-			{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
 			// Keep native SST timing setup; forcing custom clocks can break CoreDisplay validation.
 			//{"__ZN24AppleIntelBaseController17SetupDPSSTTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParams", SetupDPSSTTimings, this->oSetupDPSSTTimings},
 			//{"__ZN24AppleIntelBaseController12SetupTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2P10CRTCParams", SetupTimings, this->oSetupTimings},
@@ -686,7 +698,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x8DE14,
 			0x3788C,
 			0x383A8,
-			0x76DB6,
 		};
 		gTGLFbBase = isKnownTGLImage(address, size) ? address : 0;
 		PANIC_COND(!routeTGLDebugOffsets(patcher, requests, requestOffsets, address, size),
@@ -702,6 +713,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			PANIC_COND(!routeTGLDebugOffsets(patcher, sleepRoutes, sleepOffsets, address, size),
 				"ngreen", "Failed to route TGL debug sleep offsets");
 		}();
+		routeAUXTransactionGuard(patcher, address, size);
 
 		[&, this]() __attribute__((noinline)) {
 		if constexpr (isprod) {
@@ -2487,6 +2499,8 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 }
 
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
+	if (NGreen::callback && NGreen::callback->isRaptorLakeHX() && !ensureA788DisplayAWells(false))
+		return kIOReturnNotReady;
 
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
 
@@ -2528,7 +2542,7 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 	// INTERLANE_ALIGN_DONE=0 and tears down the display (~10s after boot).
 	// The physical link is healthy; only the IRQ flag is spurious.
 	// Clearing bit7 of DPCD[0x204] prevents the driver from acting on the IRQ.
-	if (NGreen::callback && !NGreen::callback->isRealTGL && address == 0x0202 && buffer && length >= 3) {
+	if (NGreen::callback && !NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX() && address == 0x0202 && buffer && length >= 3) {
 		auto *raw = reinterpret_cast<uint8_t *>(buffer);
 		if (raw[2] & 0x80) {
 			static int v99Logs = 0;
@@ -2570,6 +2584,11 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 	return retVal;
 }
 
+IOReturn Gen11::wrapRunAUXCommand(void *that, uint32_t command, uint32_t *data, uint32_t length, bool flag) {
+	if (NGreen::callback && NGreen::callback->isRaptorLakeHX() && !ensureA788DisplayAWells(false)) return kIOReturnNotReady;
+	return FunctionCast(wrapRunAUXCommand, callback->orgRunAUXCommand)(that, command, data, length, flag);
+}
+
 void Gen11::getOnlineInfo(AppleIntel::AppleIntelFramebuffer *that, AppleIntel::AppleIntelDisplayPath *displayPath, unsigned char *online, unsigned char *changed) {
 	// V96 removed (was: force *online=1 for fbId==0). Confirmed no-op on this hardware:
 	// baseline log shows Apple's getOnlineInfo natively reports orig=1 for FB0, so the
@@ -2601,9 +2620,7 @@ bool Gen11::wrapIsApertureMemoryRequired(AppleIntel::AppleIntelFramebuffer *that
 	bool orig = FunctionCast(wrapIsApertureMemoryRequired, callback->oIsApertureMemoryRequired)(that);
 	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 
-	// V205 freeze probe + continuous PSR1 disable. PSR1 at 0x60800 was found re-enabled
-	// post-V105 (V105 was writing wrong register 0x64800). Even with the V105 fix, Apple
-	// or DMC may re-arm PSR1 later — keep stomping it on every call.
+	// V205 freeze probe.
 	if (NGreen::callback) {
 		static uint32_t v205Calls = 0;
 		v205Calls++;
@@ -2615,29 +2632,6 @@ bool Gen11::wrapIsApertureMemoryRequired(AppleIntel::AppleIntelFramebuffer *that
 		// (wallpaper texture). Single root cause = scanout-vs-buffer tile mismatch.
 		// (Wipe proved BAR2 writes reach scanout in earlier magenta test, but WS's
 		// per-frame rewriting makes the wipe invisible.)
-
-		// Continuous PSR1+PSR2 disable — every call. PSR enabled = panel refreshes from
-		// its own cache and ignores new SURF arms → frozen frame even while pipe vsyncs.
-		uint32_t psr1Now = NGreen::callback->readReg32(0x60800);
-		if (psr1Now & 1) {
-			NGreen::callback->writeReg32(0x60800, 0);
-			static uint32_t v205PSR1Resets = 0;
-			if (v205PSR1Resets < 8) {
-				v205PSR1Resets++;
-				SYSLOG("ngreen", "V205PSR1[%u]: re-disabled PSR1 (was 0x%x) at call=%u",
-					   v205PSR1Resets, psr1Now, v205Calls);
-			}
-		}
-		uint32_t psr2Now = NGreen::callback->readReg32(0x60A10);
-		if (psr2Now & 1) {
-			NGreen::callback->writeReg32(0x60A10, 0);
-			static uint32_t v205PSR2Resets = 0;
-			if (v205PSR2Resets < 8) {
-				v205PSR2Resets++;
-				SYSLOG("ngreen", "V205PSR2[%u]: re-disabled PSR2 (was 0x%x) at call=%u",
-					   v205PSR2Resets, psr2Now, v205Calls);
-			}
-		}
 
 		// Periodic state snapshot for freeze diagnosis. Reduced thresholds since
 		// wrapIsApertureMemoryRequired only fires ~44 times per boot in FB-only mode.
@@ -2670,7 +2664,7 @@ bool Gen11::wrapIsApertureMemoryRequired(AppleIntel::AppleIntelFramebuffer *that
 				   p2ctl, p2surf, p2liv,
 				   p3ctl, p3surf, p3liv,
 				   curctl, curbase, curpos,
-				   NGreen::callback->readReg32(0x60800), NGreen::callback->readReg32(0x60A10));
+				   NGreen::callback->readReg32(0x60800), NGreen::callback->readReg32(0x60900));
 		}
 	}
 
@@ -2710,6 +2704,65 @@ IOReturn Gen11::wrapSetAttribute(void *that, uint32_t attr, uintptr_t value) {
 	return FunctionCast(wrapSetAttribute, callback->oSetAttribute)(that, attr, value);
 }
 
+static bool pwrWellRequestAndWait(uint32_t reg, uint32_t requestMask) {
+	requestMask &= 0xAAAAAAAAu;
+	const uint32_t requested = NGreen::callback->readReg32(reg) | requestMask;
+	NGreen::callback->writeReg32(reg, requested);
+	const uint32_t stateMask = requestMask >> 1;
+	if (stateMask == 0) return true;
+
+	for (int i = 0; i < 200; i++) {
+		if ((NGreen::callback->readReg32(reg) & stateMask) == stateMask) return true;
+		IODelay(10);
+	}
+	return false;
+}
+
+static void applyA788DriverRequests(uint32_t reg, uint32_t requestMask) {
+	constexpr uint32_t allRequestBits = 0xAAAAAAAAu;
+	const uint32_t requested = requestMask & allRequestBits;
+	const uint32_t current = NGreen::callback->readReg32(reg);
+	const uint32_t removedRequests = (current & allRequestBits) & ~requested;
+	const uint32_t updated = (current & ~allRequestBits) | requested;
+	NGreen::callback->writeReg32(reg, updated);
+
+	const uint32_t requestedStateMask = requested >> 1;
+	uint32_t clearStateMask = removedRequests >> 1;
+	uint32_t externalRequests = 0;
+	uint32_t now = updated;
+	for (int attempt = 0; attempt < 200; attempt++) {
+		if (removedRequests != 0) {
+			externalRequests = (NGreen::callback->readReg32(reg - 4u) |
+				NGreen::callback->readReg32(reg + 8u)) & removedRequests;
+			clearStateMask = (removedRequests & ~externalRequests) >> 1;
+		}
+		now = NGreen::callback->readReg32(reg);
+		if ((now & requestedStateMask) == requestedStateMask && (now & clearStateMask) == 0)
+			return;
+		IODelay(10);
+	}
+}
+
+static bool ensureA788DisplayAWells(bool requireDDI) {
+	if (!NGreen::callback || !NGreen::callback->isRaptorLakeHX())
+		return true;
+
+	constexpr uint32_t auxDriver = 0x45444;
+	constexpr uint32_t ddiDriver = 0x45454;
+	constexpr uint32_t portARequest = 0x2;
+	constexpr uint32_t portAReady = 0x3;
+	uint32_t auxA = NGreen::callback->readReg32(auxDriver);
+	uint32_t ddiA = NGreen::callback->readReg32(ddiDriver);
+	if ((auxA & 0x3u) != 0x3u)
+		pwrWellRequestAndWait(auxDriver, portARequest);
+	if (requireDDI && (ddiA & 0x3u) != 0x3u)
+		pwrWellRequestAndWait(ddiDriver, portARequest);
+
+	auxA = NGreen::callback->readReg32(auxDriver);
+	ddiA = NGreen::callback->readReg32(ddiDriver);
+	return (auxA & portAReady) == portAReady && (!requireDDI || (ddiA & portAReady) == portAReady);
+}
+
 // V183: ADL-P/RPL write-only power well handler.
 // HSW_PWR_WELL_CTL1 (0x45400): REQ bits = odd bits (mask 0xAA: bits 1,3,5,7,...);
 //                               STATE bits = even bits (mask 0x55: bits 0,2,4,6,...).
@@ -2744,18 +2797,30 @@ void Gen11::hwSetPowerWellStatePGE(AppleIntel::AppleIntelBaseController *that, b
 
 void Gen11::hwSetPowerWellStateAux(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2)
 {
+	if (NGreen::callback && NGreen::callback->isRaptorLakeHX()) {
+		applyA788DriverRequests(0x45444, param_2);
+		return;
+	}
 	getMember<void *>(that, 0x78) = ccont;
 	FunctionCast(hwSetPowerWellStateAux, callback->ohwSetPowerWellStateAux)(that,param_1,param_2);
 }
 
 void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2)
 {
+	if (NGreen::callback && NGreen::callback->isRaptorLakeHX()) {
+		applyA788DriverRequests(0x45454, param_2);
+		return;
+	}
 	getMember<void *>(that, 0x78) = ccont;
 	FunctionCast(hwSetPowerWellStateDDI, callback->ohwSetPowerWellStateDDI)(that,param_1,param_2);
 }
 
 void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsigned long param_1, uint32_t param_2)
 {
+	if (NGreen::callback && NGreen::callback->dmcDisabled &&
+	    ((param_1 & 0xFFFFF) == DC_STATE_EN || (param_1 & 0xFFFFF) == 0x60800 || (param_1 & 0xFFFFF) == 0x60900))
+		param_2 = 0;
+
 	// V99D: Diagnose — log all FastWrite calls near display engine range on first boot
 	// to understand what addresses/values flow through this path.
 	{
@@ -2854,6 +2919,10 @@ void Gen11::raWriteRegister32b(void *that,void *param_1,unsigned long param_2, U
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
+	if (NGreen::callback && NGreen::callback->dmcDisabled &&
+	    ((param_1 & 0xFFFFF) == DC_STATE_EN || (param_1 & 0xFFFFF) == 0x60800 || (param_1 & 0xFFFFF) == 0x60900))
+		param_2 = 0;
+
 	// V93: optional plane SURF zero-write guard.
 	// Disabled by default due black-screen regressions; enable only with -ngreenv93.
 	struct V93PlaneSurfState {
@@ -3077,15 +3146,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				// Pipe A scaler 1
 				SYSLOG("ngreen", "V203 PIPE_A_PS1: CTRL=%08x WIN_POS=%08x WIN_SZ=%08x VPHASE=%08x HPHASE=%08x",
 					   R(0x68180), R(0x68170), R(0x68174), R(0x68188), R(0x68194));
-				// DSC slice control / PPS for Pipe A (DSC_BASE_A around 0x6B200; varies by gen)
-				SYSLOG("ngreen", "V203 DSC_A: PIC_RC=%08x PPS0=%08x PPS1=%08x PPS2=%08x PPS3=%08x PPS4=%08x",
-					   R(0x6B200), R(0x6B210), R(0x6B214), R(0x6B218), R(0x6B21C), R(0x6B220));
 				// DDI buf / port
-				SYSLOG("ngreen", "V203 DDI_BUF: A_CTL=%08x B_CTL=%08x | DP_TP_CTL_A=%08x DP_TP_STATUS_A=%08x",
-					   R(0x64000), R(0x64100), R(0x64040), R(0x64044));
-				// Display Buffer programming
-				SYSLOG("ngreen", "V203 DBUF: CTL_S0=%08x CTL_S1=%08x DBUF_BUF_CFG_A_PA=%08x A_PB=%08x",
-					   R(0x44300), R(0x44304), R(0x70B80), R(0x70B84));
 				#undef R
 			}
 		}
@@ -3348,7 +3409,7 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
 
 	// Boot-arg "ngreen-dmc":
-	//   not set or "skip" → safe fallback: passthrough original + AUX only (proven working)
+	//   not set or "skip" (0xA788: any value) → no DMC: DC states and PSR off, AUX only
 	//   "tgl"             → load TGL DMC v2.12 blob + TGL display engine registers
 	//                       + ICL/TGL combo PHY signal levels (PHY_A eDP, PHY_B DP)
 	//   "adlp"            → load ADL-P DMC v2.16 blob + ADL-P display engine registers
@@ -3356,8 +3417,10 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 	//   "icl"             → passthrough original ICL DMC load + ICL combo PHY signal levels
 	char dmcArg[16] = {};
 	PE_parse_boot_argn("ngreen-dmc", dmcArg, sizeof(dmcArg));
+	NGreen::callback->dmcDisabled = false;
+	const bool raptorLakeHX = NGreen::callback->isRaptorLakeHX();
 
-	if (dmcArg[0] == 't' || dmcArg[0] == 'T') {
+	if (!raptorLakeHX && (dmcArg[0] == 't' || dmcArg[0] == 'T')) {
 		// ── TGL DMC ──
 		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=tgl, loading TGL DMC v2.12 (%u dwords)", tgl_dmc_ver2_12_bin_s / 4);
 		// Write TGL DMC blob to MMIO 0x80000+
@@ -3379,10 +3442,10 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 		}
 		NGreen::callback->writeReg32(0x45408, 0x40000000); // HSW_PWR_WELL_CTL3
 		NGreen::callback->writeReg32(0x4540C, 0x00000401); // HSW_PWR_WELL_CTL4
-		NGreen::callback->writeReg32(0x45440, 0x00000003); // ICL_PWR_WELL_CTL_AUX1 — AUX A
-		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B
-		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A
-		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B
+		pwrWellRequestAndWait(0x45440, 0x00000003);
+		pwrWellRequestAndWait(0x45444, 0x00000003);
+		pwrWellRequestAndWait(0x45450, 0x00000003);
+		pwrWellRequestAndWait(0x45454, 0x00000003);
 
 		// TGL display engine registers (DMC trigger/context regs in 0x8Fxxx range)
 		// Values from IDA of original hwInitializeCState (TGL-native values)
@@ -3427,7 +3490,7 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 			}
 		}
 
-	} else if (dmcArg[0] == 'a' || dmcArg[0] == 'A') {
+	} else if (!raptorLakeHX && (dmcArg[0] == 'a' || dmcArg[0] == 'A')) {
 		// ── ADL-P DMC ──
 		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=adlp, loading ADL-P DMC v2.16 (%u dwords)", adlp_dmc_ver2_16_bin_s / 4);
 		// adlp_dmc_ver2_16_bin is the raw firmware payload extracted from the v3 blob
@@ -3466,11 +3529,11 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 		NGreen::callback->writeReg32(0x4540C, 0x00000401); // HSW_PWR_WELL_CTL4
 		// ICL_PWR_WELL_CTL_AUX1/2 (0x45440/45444): enable AUX power wells A+B
 		// bit1=req, bit0=enabled per ICL DDI power well HW spec (intel_display_regs.h)
-		NGreen::callback->writeReg32(0x45440, 0x00000003); // ICL_PWR_WELL_CTL_AUX1 — AUX A enabled
-		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B enabled
+		pwrWellRequestAndWait(0x45440, 0x00000003);
+		pwrWellRequestAndWait(0x45444, 0x00000003);
 		// ICL_PWR_WELL_CTL_DDI1/2 (0x45450/45454): enable DDI power wells A+B
-		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A enabled
-		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B enabled
+		pwrWellRequestAndWait(0x45450, 0x00000003);
+		pwrWellRequestAndWait(0x45454, 0x00000003);
 
 		// ADL-P / RPL-P display engine registers — exact MMIO init pairs from v3 blob header
 		// (adlp_dmc_ver2_16.bin header @ 0x0210, MMIO[0..6], stepping='A' variant)
@@ -3614,11 +3677,11 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 			// from its own cache, screen frozen on first frame even while PIPE_FRMCOUNT
 			// kept advancing. Probe V205 caught this. Now writes to both addresses for
 			// safety (0x60800 = TGL, 0x64800 = legacy/ICL — covers both spoof paths).
-			uint32_t psr2ctl     = NGreen::callback->readReg32(0x60A10);  // EDP_PSR2_CTL TGL
+			uint32_t psr2ctl     = NGreen::callback->readReg32(0x60900);  // EDP_PSR2_CTL TGL
 			uint32_t psr1ctlTgl  = NGreen::callback->readReg32(0x60800);  // EDP_PSR_CTL  TGL
 			uint32_t psr1ctlIcl  = NGreen::callback->readReg32(0x64800);  // EDP_PSR_CTL  ICL
 			uint32_t psr2ctlIcl  = NGreen::callback->readReg32(0x60900);  // EDP_PSR2_CTL ICL
-			NGreen::callback->writeReg32(0x60A10, 0);  // PSR2 TGL
+			NGreen::callback->writeReg32(0x60900, 0);  // PSR2 TGL
 			NGreen::callback->writeReg32(0x60800, 0);  // PSR1 TGL  ← THE ACTUAL FIX
 			NGreen::callback->writeReg32(0x60900, 0);  // PSR2 legacy
 			NGreen::callback->writeReg32(0x64800, 0);  // PSR1 legacy
@@ -3626,7 +3689,7 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 				   psr1ctlTgl, psr2ctl, psr1ctlIcl, psr2ctlIcl);
 		}
 
-	} else if (dmcArg[0] == 'i' || dmcArg[0] == 'I') {
+	} else if (!raptorLakeHX && (dmcArg[0] == 'i' || dmcArg[0] == 'I')) {
 		// ── ICL ──
 		// ICL is the native target: let original hwInitializeCState load the ICL DMC blob,
 		// then program ICL combo PHY signal levels (same DW2/4/5/7 layout as TGL).
@@ -3642,18 +3705,23 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 		SYSLOG("ngreen", "hwInitCState: ICL done");
 
 	} else {
-		// ── skip (default, safe fallback) ──
-		// Proven working: just let original run + configure AUX.
-		// No DMC blob, no display engine register writes.
-		SYSLOG("ngreen", "hwInitCState: skip (safe fallback), passthrough original");
-		FunctionCast(hwInitializeCState, callback->ohwInitializeCState)(that);
+		NGreen::callback->dmcIsAdlp = false;
+		NGreen::callback->dmcDisabled = true;
+		NGreen::callback->writeReg32(DC_STATE_EN, 0);
+		NGreen::callback->writeReg32(0x60800, 0);
+		NGreen::callback->writeReg32(0x60900, 0);
 	}
 
+	if (raptorLakeHX && !ensureA788DisplayAWells(false)) {
+		return;
+	}
 	hwConfigureCustomAUX(that, true);
 	SYSLOG("ngreen", "hwInitCState: done");
 }
 
 void NGreen::adlpDcExit(const char *caller) {
+	if (isRaptorLakeHX())
+		ensureA788DisplayAWells();
 	if (!dmcIsAdlp) return;
 	const uint32_t dcState = readReg32(0x45504); // DC_STATE_EN
 	if (dcState == 0) return;
@@ -3685,7 +3753,7 @@ void NGreen::adlpDcExit(const char *caller) {
 	writeReg32(0xC7204, 0x67u);  // PP_CONTROL
 	// 5. Disable PSR — DMC may have re-enabled it on DC exit.
 	writeReg32(0x60800, 0u);   // EDP_PSR_CTL (TGL)
-	writeReg32(0x60A10, 0u);   // EDP_PSR2_CTL (TGL)
+	writeReg32(0x60900, 0u);   // EDP_PSR2_CTL (TGL)
 	if (adlpDcExitCount <= 48) {
 		SYSLOG("ngreen", "adlpDcExit[%s]: restore complete", caller);
 	}
@@ -3699,9 +3767,7 @@ void Gen11::AppleIntelPowerWellinit(AppleIntel::AppleIntelPowerWell *that, Apple
 
 	// After callthrough the south display domain is clocked; direct BAR read is safe.
 	uint32_t pg  = NGreen::callback->readReg32(0x45404);
-	uint32_t ddi = NGreen::callback->readReg32(0x45454);
-	uint32_t aux = NGreen::callback->readReg32(0x45444);
-	SYSLOG("ngreen", "PowerWell::init UEFI state — PG=0x%08x DDI=0x%08x AUX=0x%08x", pg, ddi, aux);
+	ensureA788DisplayAWells();
 
 	// Apple's PowerWell::init checks fController->flags_ig & FB_FLAG_BOOST_PIXEL_FREQUENCY_LIMIT
 	// (+0xC58) before setting fAlwaysOn=1. On RPL/ADL that flag isn't set when the kext first
