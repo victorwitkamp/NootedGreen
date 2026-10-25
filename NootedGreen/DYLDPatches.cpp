@@ -104,6 +104,12 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			return;
 		}
 
+		if (strstr(path, kTGLGLDriverPath) != nullptr) {
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLGLCompilerDeviceIdFind, arrsize(kTGLGLCompilerDeviceIdFind),
+				kTGLGLCompilerDeviceIdRepl, arrsize(kTGLGLCompilerDeviceIdRepl));
+			return;
+		}
+
 		if (strstr(path, kIGCPluginBundlePath) != nullptr) {
 			if (IS_RAPTOR_LAKE_HX()) {
 				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLibLLVMDepOriginal, arrsize(kLibLLVMDepOriginal),

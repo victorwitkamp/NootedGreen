@@ -332,6 +332,19 @@ static const uint8_t kTGLMTLClearStoreRepl[] = {
 static_assert(sizeof(kTGLMTLClearStoreFind) == sizeof(kTGLMTLClearStoreRepl) && sizeof(kTGLMTLClearStoreFind) == 28,
     "patch must not change the byte length - re-derive it from the TGL MTL driver 16.0.32");
 
+//! `GenContext::Initialize` passes the device id to `USC::CreateCompiler`, whose only Tiger Lake case is the
+//! simulator id 0xFF20: every real id ends in assert(0) and every OpenGL context aborts. Pass 0xFF20 instead.
+static const uint8_t kTGLGLCompilerDeviceIdFind[] = {
+    0x48, 0x8B, 0x90, 0x38, 0xA0, 0x00, 0x00,
+    0x0F, 0xB7, 0xB2, 0x8A, 0x00, 0x00, 0x00,
+};
+static const uint8_t kTGLGLCompilerDeviceIdRepl[] = {
+    0x48, 0x8B, 0x90, 0x38, 0xA0, 0x00, 0x00,
+    0xBE, 0x20, 0xFF, 0x00, 0x00, 0x90, 0x90,
+};
+static_assert(sizeof(kTGLGLCompilerDeviceIdFind) == sizeof(kTGLGLCompilerDeviceIdRepl) && sizeof(kTGLGLCompilerDeviceIdFind) == 14,
+    "patch must not change the byte length - re-derive it from the TGL GL driver 16.0.32");
+
 static const uint8_t kIGCRtIgcHSW64PathOriginal[] = {
     0x2F, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6D, 0x2F, 0x4C, 0x69, 0x62, 0x72,
     0x61, 0x72, 0x79, 0x2F, 0x45, 0x78, 0x74, 0x65, 0x6E, 0x73, 0x69, 0x6F,
@@ -452,6 +465,8 @@ static_assert(sizeof(kMetalDescWmFragmentFuncOriginal) == sizeof(kMetalDescWmFra
 static const char kIGCPluginBundlePath[] = "libMTLIGCCompilerPlugin.dylib";
 
 static const char kTGLMetalDriverPath[] = "/AppleIntelTGLGraphicsMTLDriver.bundle/";
+
+static const char kTGLGLDriverPath[] = "/AppleIntelTGLGraphicsGLDriver.bundle/";
 
 static const char kCoreLSKDMSEPath[] = "/System/Library/PrivateFrameworks/CoreLSKDMSE.framework/Versions/A/CoreLSKDMSE";
 static const char kCoreLSKDPath[] = "/System/Library/PrivateFrameworks/CoreLSKD.framework/Versions/A/CoreLSKD";
