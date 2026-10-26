@@ -7647,8 +7647,13 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 		void *b8 = ctx ? getMember<void *>(ctx, 0xb8) : nullptr;
 		if (ctx && (b8 || !NGreen::callback->isRealTGL)) {
 			if (ctx != callback->v131CachedBlit3DCtx) {
-				SYSLOG("ngreen", "V194: getBlit3DContext ctx changed %p -> %p (restart recovery), updating cache",
-					   callback->v131CachedBlit3DCtx, ctx);
+				// Each task has its own Blit3D context, so the cache changes whenever two tasks blit (tens of times a second at
+				// the desktop): log the first changes and then powers of two.
+				static volatile uint32_t changes = 0;
+				const uint32_t n = __sync_add_and_fetch(&changes, 1u);
+				if (n <= 16 || (n & (n - 1u)) == 0)
+					SYSLOG("ngreen", "V194: getBlit3DContext ctx changed %p -> %p (change #%u), updating cache",
+						   callback->v131CachedBlit3DCtx, ctx, n);
 				callback->v131CachedBlit3DCtx = ctx;
 			} else if (isExperimentalMonitorEnabled()) {
 				SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p ctx+0xb8=%p",
