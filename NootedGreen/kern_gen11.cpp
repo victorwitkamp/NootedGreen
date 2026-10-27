@@ -1929,6 +1929,64 @@ void Gen11::routeResolveInit(KernelPatcher &patcher, size_t index, mach_vm_addre
 	if (!RouteRequestPlus::routeAll(patcher, index, route, address, size)) patcher.clearError();
 }
 
+// After a restart, beginReset gives the hung RCS context the accelerator's safe image, so a resolve context loses the state its
+// preamble set once, at creation (resolve_init_ctx_g7: URB and L3 allocation, SIP, the state pointers and the disabled stages); its
+// next resolves then stall in VF / VS. Such a context is initialised again before its next use, as at creation.
+static mach_vm_address_t gOrgBeginReset = 0, gResolveCtxInitialize = 0, gSchedPriority = 0;
+static constexpr mach_vm_address_t kSchedPrioritySize = 0xfa;
+static constexpr uint64_t kResolvePreamble = 0x9c0;	// resolve_init_ctx_g7's 0x9b8 bytes + the batch end the init wrapper adds
+static void *volatile gResolveCtxReset[16];
+static bool wrapBeginReset(void *ctx) {
+	const bool ok = FunctionCast(wrapBeginReset, gOrgBeginReset)(ctx);
+	if (!ok || ctx == nullptr || reinterpret_cast<OSObject *>(ctx)->metaCast("IGHardwareResolveContext") == nullptr) return ok;
+	for (auto &slot : gResolveCtxReset)
+		if (slot == ctx) return ok;
+	for (auto &slot : gResolveCtxReset)
+		if (__sync_bool_compare_and_swap(&slot, nullptr, ctx)) break;
+	return ok;
+}
+static void forgetResetResolveContext(void *ctx) {
+	for (auto &slot : gResolveCtxReset)
+		if (slot == ctx) __sync_bool_compare_and_swap(&slot, ctx, nullptr);
+}
+// Not from updateSchedPriority: the one getter caller from which Apple never creates (so never initialises) a context.
+static void initResolveContextAfterReset(void *ctx, const void *caller) {
+	const auto from = reinterpret_cast<mach_vm_address_t>(caller);
+	if (ctx == nullptr || gResolveCtxInitialize == 0 || (from >= gSchedPriority && from < gSchedPriority + kSchedPrioritySize))
+		return;
+	for (auto &slot : gResolveCtxReset) {
+		if (slot != ctx) continue;
+		// As at creation: room for the preamble in the buffer, and the two dwords it never writes (+0x5b0) zero. The mark goes
+		// only once the re-init is certain to run: a failed room check keeps it for the next getter call.
+		reserveResolveWindow(ctx);
+		auto *pool = getMember<uint8_t *>(ctx, 0xe0);
+		const uint64_t ptr = pool != nullptr ? *reinterpret_cast<volatile uint64_t *>(pool + 0x1858) : 0;
+		const uint64_t lim = pool != nullptr ? *reinterpret_cast<volatile uint64_t *>(pool + 0x1850) : 0;
+		if (ptr == 0 || ptr + kResolvePreamble > lim) return;
+		if (!__sync_bool_compare_and_swap(&slot, ctx, nullptr)) return;
+		bzero(reinterpret_cast<void *>(ptr), kResolvePreamble);
+		using Initialize = bool (*)(void *);
+		reinterpret_cast<Initialize>(gResolveCtxInitialize)(ctx);
+		return;
+	}
+}
+
+static void routeContextReset(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	// The marks are cleared when a context is freed: without that route a freed context's address could be re-initialised.
+	if (!isKnownTGLImage(address, size) || gCtxFreeRouted == 0) return;
+	gResolveCtxInitialize = patcher.solveSymbol(index, "__ZN24IGHardwareResolveContext10initializeEv", address, size);
+	gSchedPriority = patcher.solveSymbol(index, "__ZN17IGHardwareContext19updateSchedPriorityEh", address, size);
+	if (gResolveCtxInitialize == 0 || gSchedPriority == 0) {
+		patcher.clearError();
+		gResolveCtxInitialize = 0;
+		return;
+	}
+	RouteRequestPlus route[] = {
+		{"__ZN17IGHardwareContext10beginResetEv", wrapBeginReset, gOrgBeginReset},
+	};
+	if (!RouteRequestPlus::routeAll(patcher, index, route, address, size)) patcher.clearError();
+}
+
 static int getV77KillDelayIterations() {
 	int delay = 0;
 	if (PE_parse_boot_argn("ngreenV77DelayKill", &delay, sizeof(delay))) {
@@ -3118,6 +3176,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			patchPixelFormat(address, size, pixelFormat);
 		}
 		routeResolveInit(patcher, index, address, size);
+		routeContextReset(patcher, index, address, size);
 
 		{
 			RouteRequestPlus startRoute[] = {
@@ -7338,6 +7397,7 @@ void Gen11::wrapContextFree(void *that)
 	ctxFreeLock();
 	if (cb != nullptr && that != nullptr && that == cb->lastRCSCtx) cb->lastRCSCtx = nullptr;
 	ctxFreeUnlock();
+	forgetResetResolveContext(that);
 	FunctionCast(wrapContextFree, callback->oContextFree)(that);
 }
 
@@ -9013,7 +9073,7 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 	return FunctionCast(getBlit2DContext, callback->ogetBlit2DContext)(that,param_1);
 }
 
-void * Gen11::getDepthResolveContext(void *that,bool param_1)
+void * __attribute__((noinline)) Gen11::getDepthResolveContext(void *that,bool param_1)
 {
 	if (!callback->ogetDepthResolveContext) {
 		static bool v136DepthLogged = false;
@@ -9024,6 +9084,7 @@ void * Gen11::getDepthResolveContext(void *that,bool param_1)
 		return nullptr;
 	}
 	void *ctx = FunctionCast(getDepthResolveContext, callback->ogetDepthResolveContext)(that,param_1);
+	initResolveContextAfterReset(ctx, __builtin_return_address(0));
 	if (isExperimentalMonitorEnabled()) {
 		static int v137DepthCount = 0;
 		if (v137DepthCount < 32) {
@@ -9036,7 +9097,7 @@ void * Gen11::getDepthResolveContext(void *that,bool param_1)
 	return ctx;
 }
 
-void * Gen11::getColorResolveContext(void *that,bool param_1)
+void * __attribute__((noinline)) Gen11::getColorResolveContext(void *that,bool param_1)
 {
 	if (!callback->ogetColorResolveContext) {
 		static bool v136ColorLogged = false;
@@ -9047,6 +9108,7 @@ void * Gen11::getColorResolveContext(void *that,bool param_1)
 		return nullptr;
 	}
 	void *ctx = FunctionCast(getColorResolveContext, callback->ogetColorResolveContext)(that,param_1);
+	initResolveContextAfterReset(ctx, __builtin_return_address(0));
 	if (isExperimentalMonitorEnabled()) {
 		static int v137ColorCount = 0;
 		if (v137ColorCount < 32) {
