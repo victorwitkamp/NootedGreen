@@ -1936,8 +1936,53 @@ static mach_vm_address_t gOrgBeginReset = 0, gResolveCtxInitialize = 0, gSchedPr
 static constexpr mach_vm_address_t kSchedPrioritySize = 0xfa;
 static constexpr uint64_t kResolvePreamble = 0x9c0;	// resolve_init_ctx_g7's 0x9b8 bytes + the batch end the init wrapper adds
 static void *volatile gResolveCtxReset[16];
+// The safe image beginReset restores was saved from one of the accelerator's own POCS contexts, and beginReset writes back only
+// the page-table pointers: the per-context writes initWithOptions makes after the same restore (0x7c15e-0x7c343) are left at the golden
+// context's values — CONTEXT_CONTROL bit 4 (the POCS enable, set for the golden, cleared for a resolve / Blit3D context), the POCS image
+// pointer at +0x10d8 (the golden's, a buffer released at start-up; a POCS context's own otherwise), the 0x80008 bits, the task's AUX table
+// base, +0x110c, the telemetry patch and ctx+0xd0. They are repeated here, in Apple's order, for every RCS context the restore touched.
+static mach_vm_address_t gSharedBufferVA = 0, gMappedGpuVA = 0, gPatchCtxImageRCS = 0;
+static void reapplyContextInit(void *ctx) {
+	if (gSharedBufferVA == 0 || gMappedGpuVA == 0 || getMember<uint8_t>(ctx, 0x6c) != 0) return;
+	using VA = uint8_t *(*)(void *);
+	using GpuVA = uint64_t (*)(void *);
+	void *imageBuf = getMember<void *>(ctx, 0x98);
+	uint8_t *img = imageBuf != nullptr ? reinterpret_cast<VA>(gSharedBufferVA)(imageBuf) : nullptr;
+	if (img == nullptr) return;
+	auto r32 = [](uint8_t *p) { return *reinterpret_cast<volatile uint32_t *>(p); };
+	auto w32 = [](uint8_t *p, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(p) = v; };
+	const uint16_t flags = getMember<uint16_t>(ctx, 0x6e);
+	auto *accel = getMember<uint8_t *>(ctx, 0x50);
+	void *task = getMember<void *>(ctx, 0x58);
+	void *pocsBuf = (flags & 0x10) != 0 ? getMember<void *>(ctx, 0xa0) : nullptr;
+	if ((flags & 0x10) == 0) w32(img + 0x100c, (r32(img + 0x100c) & 0xffefffefu) | 0x100000u);
+	else if (pocsBuf != nullptr) w32(img + 0x10d8, static_cast<uint32_t>(reinterpret_cast<GpuVA>(gMappedGpuVA)(pocsBuf)));
+	const uint32_t accelFlags = accel != nullptr ? getMember<uint32_t>(accel, 0x1190) : 0;
+	if ((accelFlags & 0x18000u) != 0) {
+		w32(img + 0x100c, r32(img + 0x100c) | 0x80008u);
+		uint8_t *pocs = pocsBuf != nullptr ? reinterpret_cast<VA>(gSharedBufferVA)(pocsBuf) : nullptr;
+		if (pocs != nullptr) w32(pocs + 0x100c, r32(pocs + 0x100c) | 0x80008u);
+	}
+	void *aux = task != nullptr ? getMember<void *>(task, 0x278) : nullptr;
+	void *l3 = aux != nullptr ? getMember<void *>(aux, 0x10) : nullptr;
+	if (l3 != nullptr) {
+		const uint64_t base = reinterpret_cast<GpuVA>((*reinterpret_cast<void ***>(l3))[0x130 / sizeof(void *)])(l3);
+		w32(img + 0x1134, static_cast<uint32_t>(base >> 32));
+		w32(img + 0x113c, static_cast<uint32_t>(base));
+	}
+	w32(img + 0x110c, 0x80000000u);
+	auto *telemetry = accel != nullptr ? getMember<uint8_t *>(accel, 0xf10) : nullptr;
+	if (telemetry != nullptr) {
+		if (gPatchCtxImageRCS != 0) {
+			using Patch = void (*)(void *, void *);
+			reinterpret_cast<Patch>(gPatchCtxImageRCS)(telemetry, img);
+		}
+		getMember<uint64_t>(ctx, 0xd0) = getMember<uint64_t>(telemetry, 0x268);
+	}
+}
 static bool wrapBeginReset(void *ctx) {
 	const bool ok = FunctionCast(wrapBeginReset, gOrgBeginReset)(ctx);
+	if (ok && ctx != nullptr) reapplyContextInit(ctx);
 	if (!ok || ctx == nullptr || reinterpret_cast<OSObject *>(ctx)->metaCast("IGHardwareResolveContext") == nullptr) return ok;
 	for (auto &slot : gResolveCtxReset)
 		if (slot == ctx) return ok;
@@ -1980,6 +2025,14 @@ static void routeContextReset(KernelPatcher &patcher, size_t index, mach_vm_addr
 		patcher.clearError();
 		gResolveCtxInitialize = 0;
 		return;
+	}
+	// The image's virtual address, a buffer's GPU address, the telemetry patch (optional).
+	gSharedBufferVA = patcher.solveSymbol(index, "__ZNK20IGSharedMappedBuffer17getVirtualAddressEv", address, size);
+	gMappedGpuVA = patcher.solveSymbol(index, "__ZNK14IGMappedBuffer20getGPUVirtualAddressEv", address, size);
+	gPatchCtxImageRCS = patcher.solveSymbol(index, "__ZN18IGTelemetryManager20patchContextImageRCSEP27SGfxHardwareContextImageRCS", address, size);
+	if (gSharedBufferVA == 0 || gMappedGpuVA == 0 || gPatchCtxImageRCS == 0) {
+		patcher.clearError();
+		if (gSharedBufferVA == 0 || gMappedGpuVA == 0) gSharedBufferVA = gMappedGpuVA = 0;
 	}
 	RouteRequestPlus route[] = {
 		{"__ZN17IGHardwareContext10beginResetEv", wrapBeginReset, gOrgBeginReset},
