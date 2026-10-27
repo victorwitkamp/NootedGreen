@@ -6352,6 +6352,10 @@ int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIn
 	return ret;
 }
 
+// The IOVARendererID the TGL VA driver reports for itself (AppleIntelTGLGraphicsVADriver _AVD_CreateAVDAccelerator); AppleGVA's
+// allowlist takes it, not the personality's 17301568 (0x1080040).
+static constexpr uint32_t kVARendererIDTGLDriver = 0x1080080u;
+
 // HW hooks
 
 static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs);
@@ -6968,6 +6972,18 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		bool hasVARID = (accelSvc->getProperty("IOVARendererID") != nullptr);
 		SYSLOG("ngreen", "V45: properties present: MetalPlugin=%d GL=%d CFPlugIn=%d VARend=%d",
 			   hasMetal, hasGL, hasCFPI, hasVARID);
+
+		// AppleGVA connects a VA plug-in only when the accelerator's IOVARendererID is on its allowlist (0x1080000 + {0, 1, 2, 4,
+		// 8, 0x10, 0x20}, 0x1080080, ...); Apple's TGL personality publishes 0x1080040, which is not, so no hardware decoder is ever
+		// created (VideoToolbox still advertises H.264: it only selects). Apple's own TGL VA driver reports itself as 0x1080080 (ICL's),
+		// and that is the value published here.
+		if (NGreen::callback != nullptr && NGreen::callback->isRaptorLakeHX()) {
+			auto *rid = OSNumber::withNumber(static_cast<unsigned long long>(kVARendererIDTGLDriver), 32);
+			if (rid != nullptr) {
+				accelSvc->setProperty("IOVARendererID", rid);
+				rid->release();
+			}
+		}
 			   
 		//v44ScheduleBundleLog(that, 500);
 		v44ScheduleBundleLog(that, 3000);
@@ -6988,7 +7004,7 @@ unsigned long Gen11::start(void *that,void  *param_1)
 			accelSvc->setProperty("IOGVAScaler", "Gen10");
 			accelSvc->setProperty("IOGVABGRAEnc", "Gen10");
 			accelSvc->setProperty("IOSourceVersion", "0.0.0.0.0");
-			auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32);
+			auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(kVARendererIDTGLDriver), 32);
 			if (vaRendID) { accelSvc->setProperty("IOVARendererID", vaRendID); vaRendID->release(); }
 			// V77: DisplayPipeSupported=0 — disable GPU display pipe compositing.
 			// WindowServer crash-loops (consecutiveCrashCount=11) in
@@ -11966,7 +11982,7 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	auto *vaCodec  = OSString::withCString("Gen10");
 	auto *vaScaler = OSString::withCString("Gen10");
 	auto *vaBGRA   = OSString::withCString("Gen10");
-	auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32); // 0x1084000
+	auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(kVARendererIDTGLDriver), 32);
 
 	dict->setObject("MetalPluginName", mtl);
 	dict->setObject("IOGLBundleName", gl);
