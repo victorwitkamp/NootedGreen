@@ -377,6 +377,57 @@ NootedGreen (Gen11/Gen12 — TGL driver spoofing):
 | **Rocket Lake** | ~25% | — | Gen12 LP but different display engine. Untested. |
 | **Ice Lake** | ~50% | V52 | Dedicated ICL path exists (ICL FB + ICL HW kextInfos, ICL-specific object offsets in `getGPUInfoICL`, SKU gate×3, platform remap, PAVP hook, DYLD ICL Metal device-ID bypass). Topology hardcoded to ICL GT2 LP (1×8×8=64EU). IRQ init disabled (V37 boot hang). ICL path only activates when TGL kexts are absent. Untested on real ICL hardware. |
 
+## Raptor Lake-HX (8086:A788)
+
+Tested on one machine, an Asus ROG Strix G814JI (Core i9-13980HX, iGPU `8086:A788`, 32 EUs), with macOS 15.7.1 (24G231). The
+GPU is reported to macOS as Tiger Lake (`0x9A49`) and runs Apple's 2020 Tiger Lake drivers from `sle_Internal`.
+
+What works: the internal eDP panel at 2560x1600, 60 Hz, with the brightness slider; the login and the desktop, composited by
+WindowServer on the GPU; Metal; the GPU clock up to 1200 MHz under load. OpenGL apps start (tested less than the rest).
+
+Known issues: sleep and wake; 240 Hz (the panel's DSC mode); external displays; hardware video decode is untested; a GPU hang
+can still happen under heavy 3D work (a game's depth buffers) and after long sessions in some apps.
+
+### What to install
+
+1. **Lilu** 1.7.2 or newer, and NootedGreen, through OpenCore.
+2. **The Tiger Lake kexts** from `sle_Internal/le`, `AppleIntelTGLGraphics.kext` and `AppleIntelTGLGraphicsFramebuffer.kext`, in
+   `/Library/Extensions`, with four `Info.plist` edits:
+   - `AppleIntelTGLGraphics.kext`: the `Gen7` personality's `IOPCIPrimaryMatch` becomes `0xff208086 0x9a498086 0xa7888086`;
+   - `AppleIntelTGLGraphicsFramebuffer.kext`: in `FeatureControl`, `DSCSupport` 1, `DSCCapReporting` 1,
+     `SupportPSRwithExternalDisplay` 0; `OSBundleRequired` removed.
+
+   Then sign both ad hoc (`codesign -f -s -`), add them to the auxiliary kernel collection (`kmutil install --volume-root /
+   --update-all`) and approve them in System Settings. NootedGreen is bound to these two images (it checks their UUIDs): with
+   another build of either kext it stops the boot with a panic that names the routes it could not place.
+3. **HookCase.** Both kexts link against `org.smichaud.HookCase` 1.0 and import 11 symbols from it. Use
+   [HookCaseBridge](https://github.com/victorwitkamp/HookCaseBridge), which exports exactly those symbols under that identifier,
+   installed beside them in `/Library/Extensions`.
+4. **The user-space drivers** in `/Library/GPUBundles`, the one directory from which the WindowServer and MTLCompilerService
+   sandboxes map code:
+   - `tools/gpubundles`: a LaunchDaemon that copies the Metal, OpenGL, VA and VAME bundles and `AppleIntelGraphicsShared.bundle`
+     from `/Library/Extensions` (`sle_Internal/sle`'s, unchanged) into `/Library/GPUBundles`;
+   - `tools/igc-shim`: a shim in front of the 2020 Metal compiler plugin, so it compiles shaders with its own LLVM; `build.sh`
+     installs it;
+   - `/Library/GPUBundles/libLLVM.dylib`: the LLVM the 2020 plugin was built against. It is GPUCompiler 3902's
+     `libLLVM.dylib` from macOS 11.7.10 (the full installer: `softwareupdate --fetch-full-installer --full-installer-version
+     11.7.10`), where it exists only inside the dyld shared cache. To load on macOS 15 it was extracted from the cache with its
+     dyld information (`ipsw dyld extract --slide`), its segments put in address order and padded to page boundaries without
+     moving any byte's address, rebase entries written for its internal pointers, binds added for its pointers into other Big Sur
+     libraries, its weak definitions bound to itself (so they do not coalesce with macOS 15's own LLVM in MTLCompilerService), and
+     signed ad hoc. No script for this is included.
+5. **OpenCore.** `DeviceProperties` for `PciRoot(0x0)/Pci(0x2,0x0)`: `AAPL,ig-platform-id` `00 00 49 9A`, `device-id`
+   `49 9A 00 00`, `AAPL,boot-display`; the discrete GPU disabled; `SSDT-PNLF` for the brightness slider. Boot arguments:
+   `-ngreentglwithgfx -ngreenv189 -allow3d -disablegfxfirmware -ngreenfullmtlcore` (`ngreen-dmc` is ignored on this GPU).
+
+### Security trade-offs
+
+- SIP is relaxed to `csr-active-config` `0x253` (unsigned kexts, writes to `/Library/GPUBundles`); the smallest value that works
+  has not been established. The system volume stays sealed.
+- NootedGreen lets every process map executable code and load libraries from `/Library/GPUBundles` that the sandbox or library
+  validation would refuse, for that directory only.
+- The two kexts, HookCaseBridge and `libLLVM.dylib` are signed ad hoc; the user-space drivers keep Apple's 2020 signatures.
+
 ## Building
 
 Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the Gen11/Gen12 plugin, or one of the original NootedBlue schemes for legacy hardware. Build with Xcode.
