@@ -6983,6 +6983,10 @@ unsigned long Gen11::start(void *that,void  *param_1)
 				accelSvc->setProperty("IOVARendererID", rid);
 				rid->release();
 			}
+			// VideoToolbox keeps a GVA decoder plug-in only when an entry under the accelerator carries the key its plist names:
+			// IOGVAHEVCDecode for the HEVC decoder (Apple's ICL / KBL personalities publish "2"; the TGL one publishes none). The TGL VA
+			// driver decodes HEVC and AVC only, so IOGVAXDecode (VP9) and IOGVAHEVCEncode stay absent.
+			accelSvc->setProperty("IOGVAHEVCDecode", "2");
 		}
 			   
 		//v44ScheduleBundleLog(that, 500);
