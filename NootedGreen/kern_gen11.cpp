@@ -2271,7 +2271,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// tiling bits (mask 0xF800000), PLANE_STRIDE (+0x18), PLANE_SURF (+0x20)
 			// for both old and new PLANEPARAMS, plus CRTCParams PIPE_SRCSZ.
 			{"__ZN24AppleIntelBaseController17paramsSurfCompareEP10CRTCParamsS1_PN15AppleIntelPlane11PLANEPARAMSES4_", paramsSurfCompare, this->oparamsSurfCompare},
-			// V402: setupDSCEngineParams — latches the DSC parameters for the VDSC flush.
+			// setupDSCEngineParams: latches the DSC parameters for the VDSC flush.
 			{"__ZN24AppleIntelBaseController20setupDSCEngineParamsEP21AppleIntelFramebufferP10CRTCParamsP21AppleIntelDisplayPathP29IODetailedTimingInformationV2", setupDSCEngineParams, this->osetupDSCEngineParams},
 			// V403: SetupParams — master CRTCParams builder. Read-only logger of all
 			// key fields after Apple populates the struct. Single chokepoint where
@@ -3742,7 +3742,7 @@ bool Gen11::paramsSurfCompare(AppleIntel::AppleIntelBaseController *that,
 	return ret;
 }
 
-// V402: AppleIntelBaseController::setupDSCEngineParams — latches the DSC parameters for the VDSC flush.
+// AppleIntelBaseController::setupDSCEngineParams: latches the DSC parameters for the VDSC flush.
 void Gen11::setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
                                  AppleIntel::AppleIntelFramebuffer *fb,
                                  AppleIntel::CRTCParams *params,
@@ -4708,7 +4708,7 @@ bool Gen11::wrapIsApertureMemoryRequired(AppleIntel::AppleIntelFramebuffer *that
 	bool orig = FunctionCast(wrapIsApertureMemoryRequired, callback->oIsApertureMemoryRequired)(that);
 	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 
-	// V205 freeze probe.
+	// Panel-freeze probe: the pipe, plane and cursor registers on the first calls.
 	if (NGreen::callback) {
 		static uint32_t v205Calls = 0;
 		v205Calls++;
@@ -11415,8 +11415,8 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint32_t ctx) {
 
 	const bool fwLockHeld = ctx == 1;
 
-	// V61: silenced per-call logging — was flooding Lilu circular buffer (384+ entries/boot)
-	// preventing V60M health monitor and delayed child check entries from surviving
+	// Per-call logging stays off here: it flooded Lilu's circular buffer (384+ rows a boot)
+	// and pushed the health-monitor and delayed-child-check rows out.
 	
 	// ctx 2: IRQ, ctx 1: normal
 	uint32_t ack_exp = set << ctx;

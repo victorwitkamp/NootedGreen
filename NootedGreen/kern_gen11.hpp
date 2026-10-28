@@ -2025,7 +2025,7 @@ private:
 
 	static void applyPreStartEngineWorkarounds(int callCount); // only error/EMR clear — safe before ring init
 	static void applyPreStopEngineWorkarounds(int callCount);  // full GT WAs + BCS drain — before stop only
-	static bool stopGraphicsEngine(void *that);    // V505: dump ring preamble before ring is stopped
+	static bool stopGraphicsEngine(void *that);    // logs the ring preamble before the ring is stopped
 	mach_vm_address_t ostopGraphicsEngine {};
 
 	void routeResolveInit(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) __attribute__((noinline));
