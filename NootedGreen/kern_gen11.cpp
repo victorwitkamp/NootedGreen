@@ -1554,8 +1554,8 @@ static void scanoutSnapshot(bool late) {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr) return;
 	if (__sync_bool_compare_and_swap(&gImrFixDone, 0u, 1u)) {
-		const uint32_t imrPre = cb->readReg32(0x44404);
-		if (imrPre & (1u << 31)) cb->writeReg32(0x44404, imrPre & ~(1u << 31));
+		const uint32_t imrPre = cb->readReg32(GEN8_DE_PIPE_IMR_A);
+		if (imrPre & GEN8_PIPE_FIFO_UNDERRUN) cb->writeReg32(GEN8_DE_PIPE_IMR_A, imrPre & ~GEN8_PIPE_FIFO_UNDERRUN);
 	}
 	if (late && cb->isRaptorLakeHX() && gAuxSeen)
 		ensureA788DisplayAWells(false);
@@ -4938,11 +4938,11 @@ void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, b
 	FunctionCast(hwSetPowerWellStateDDI, callback->ohwSetPowerWellStateDDI)(that,param_1,param_2);
 }
 
-static constexpr uint32_t kDePipeAImr = 0x44404u;
-static constexpr uint32_t kGen8PipeFifoUnderrun = 0x80000000u;
-
+// From i915, drivers/gpu/drm/i915/display/intel_fifo_underrun.c, bdw_set_fifo_underrun_reporting: GEN8_PIPE_FIFO_UNDERRUN is
+// unmasked in GEN8_DE_PIPE_IMR while underrun reporting is on. Apple masks it on every write of pipe A's IMR; this keeps it unmasked.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_fifo_underrun.c#L283-L290
 static uint32_t fixPipeAImr(uint32_t val) {
-	return IS_RAPTOR_LAKE_HX() ? val & ~kGen8PipeFifoUnderrun : val;
+	return IS_RAPTOR_LAKE_HX() ? val & ~GEN8_PIPE_FIFO_UNDERRUN : val;
 }
 
 void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsigned long param_1, uint32_t param_2)
@@ -5001,7 +5001,7 @@ void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsi
 				   v99FCpCount, param_2, tiling);
 		}
 	}
-	if ((param_1 & 0xFFFFF) == kDePipeAImr) {
+	if ((param_1 & 0xFFFFF) == GEN8_DE_PIPE_IMR_A) {
 		param_2 = fixPipeAImr(param_2);
 	}
 	// V103F removed (was: FastWriteRegister32 twin of V103 — block DC_STATE_EN
@@ -5168,7 +5168,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				   v99CPassCount, param_2, tiling);
 		}
 	}
-	if ((param_1 & 0xFFFFF) == kDePipeAImr) {
+	if ((param_1 & 0xFFFFF) == GEN8_DE_PIPE_IMR_A) {
 		param_2 = fixPipeAImr(param_2);
 	}
 

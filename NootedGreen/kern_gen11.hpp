@@ -543,6 +543,8 @@ __typeof(divisor) __d = divisor;			\
 
 #define GEN8_DE_PIPE_ISR_A  (0x44400)
 #define GEN8_DE_PIPE_IMR_A  (0x44404)
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L1398-L1401
+#define  GEN8_PIPE_FIFO_UNDERRUN	REG_BIT(31)
 #define GEN8_DE_PIPE_IIR_A  (0x44408)
 #define GEN8_DE_PIPE_IER_A  (0x4440c)
 
