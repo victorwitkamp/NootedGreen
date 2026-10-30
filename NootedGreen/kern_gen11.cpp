@@ -4201,60 +4201,155 @@ void Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const I
 
 	}
 
-static bool dpllValuesFor(uint8_t rateCode, uint32_t &cfgcr0, uint32_t &cfgcr1) {
-	cfgcr0 = 0x00E001A5u;
-	switch (rateCode) {
-		case 0x06: cfgcr1 = 0x90u; return true;
-		case 0x0a: cfgcr1 = 0x88u; return true;
-		case 0x0c: cfgcr1 = 0x50u; return true;
-		case 0x14: cfgcr1 = 0x48u; return true;
-		case 0x1e: cfgcr1 = 0x44u; return true;
-		default:   cfgcr1 = 0;     return false;
+// From i915, drivers/gpu/drm/i915/display/intel_dpll_mgr.c: the combo PLL parameters of a DP link (icl_dp_combo_pll_19_2MHz_values, the
+// table of a 38.4 MHz reference too; icl_calc_dp_combo_pll picks the row by port clock), the register values icl_calc_dpll_state makes of
+// them (on display 12 with a 38.4 MHz reference the DCO fraction is halved: ehl_combo_pll_div_frac_wa_needed), and the sequences
+// icl_pll_disable and combo_pll_enable (icl_pll_power_enable, icl_dpll_write, icl_pll_enable; each wait is 1 ms). The reference clock is
+// read as icl_readout_refclk reads it (intel_cdclk.c, SKL_DSSM). The registers: display/intel_display_regs.h; ADL-S's DPLL0 has the TGL
+// layout (_DPLL0_ENABLE, _TGL_DPLL0_CFGCR0 / CFGCR1).
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dpll_mgr.c#L1606-L1614
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dpll_mgr.c#L2628-L2700
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dpll_mgr.c#L2915-L2940
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dpll_mgr.c#L3812-L3852
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dpll_mgr.c#L3960-L4034
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dpll_mgr.c#L4082-L4111
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_cdclk.c#L1766-L1782
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L1781-L1785
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2936-L2943
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2992-L3038
+struct skl_wrpll_params { uint32_t dco_fraction, dco_integer, qdiv_ratio, qdiv_mode, kdiv, pdiv; };
+struct icl_combo_pll_params { int clock; skl_wrpll_params wrpll; };
+
+/* Also used for 38.4 MHz values. */
+static const icl_combo_pll_params icl_dp_combo_pll_19_2MHz_values[] = {
+	{ 540000, { 0x7000, 0x1A5, 0, 0, 1, 0x2 /* 3 */ } },	/* [0]: 5.4 */
+	{ 270000, { 0x7000, 0x1A5, 0, 0, 2, 0x2 /* 3 */ } },	/* [1]: 2.7 */
+	{ 162000, { 0x7000, 0x1A5, 0, 0, 2, 0x4 /* 5 */ } },	/* [2]: 1.62 */
+	{ 324000, { 0x7000, 0x1A5, 0, 0, 1, 0x4 /* 5 */ } },	/* [3]: 3.24 */
+	{ 216000, { 0x0000, 0x1C2, 2, 1, 2, 0x1 /* 2 */ } },	/* [4]: 2.16 */
+	{ 432000, { 0x0000, 0x1C2, 0, 0, 2, 0x1 /* 2 */ } },	/* [5]: 4.32 */
+	{ 648000, { 0x2000, 0x1FA, 0, 0, 1, 0x2 /* 3 */ } },	/* [6]: 6.48 */
+	{ 810000, { 0x7000, 0x1A5, 0, 0, 1, 0x1 /* 2 */ } },	/* [7]: 8.1 */
+};
+
+static constexpr uint32_t _DPLL0_ENABLE     = 0x46010u;
+static constexpr uint32_t PLL_ENABLE        = 1u << 31;
+static constexpr uint32_t PLL_LOCK          = 1u << 30;
+static constexpr uint32_t PLL_POWER_ENABLE  = 1u << 27;
+static constexpr uint32_t PLL_POWER_STATE   = 1u << 26;
+static constexpr uint32_t _TGL_DPLL0_CFGCR0 = 0x164284u;
+static constexpr uint32_t _TGL_DPLL0_CFGCR1 = 0x164288u;
+#define DPLL_CFGCR0_DCO_FRACTION(x)	((x) << 10)
+#define DPLL_CFGCR1_QDIV_RATIO(x)	((x) << 10)
+#define DPLL_CFGCR1_QDIV_MODE(x)	((x) << 9)
+#define DPLL_CFGCR1_KDIV(x)		((x) << 6)
+#define DPLL_CFGCR1_PDIV(x)		((x) << 2)
+#define TGL_DPLL_CFGCR1_CFSELOVRD_NORMAL_XTAL	(0 << 0)
+
+// drm_dp_bw_code_to_link_rate (drm_dp_helper.c): a DP_LINK_BW_SET code counts the link rate in 27 MHz units.
+static inline int drm_dp_bw_code_to_link_rate(uint8_t link_bw) { return link_bw * 27000; }
+
+static bool icl_calc_dp_combo_pll(int clock, skl_wrpll_params &pll_params) {
+	for (const auto &row : icl_dp_combo_pll_19_2MHz_values) {
+		if (clock == row.clock) {
+			pll_params = row.wrpll;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void icl_calc_dpll_state(uint32_t ref_clk, const skl_wrpll_params &pll_params, uint32_t &cfgcr0, uint32_t &cfgcr1) {
+	uint32_t dco_fraction = pll_params.dco_fraction;
+	if (ref_clk == 38400)	/* ehl_combo_pll_div_frac_wa_needed: display 12 with a 38.4 MHz reference */
+		dco_fraction = (dco_fraction + 1u) / 2u;	/* DIV_ROUND_CLOSEST(dco_fraction, 2) */
+	cfgcr0 = DPLL_CFGCR0_DCO_FRACTION(dco_fraction) | pll_params.dco_integer;
+	cfgcr1 = DPLL_CFGCR1_QDIV_RATIO(pll_params.qdiv_ratio) | DPLL_CFGCR1_QDIV_MODE(pll_params.qdiv_mode) |
+	         DPLL_CFGCR1_KDIV(pll_params.kdiv) | DPLL_CFGCR1_PDIV(pll_params.pdiv) | TGL_DPLL_CFGCR1_CFSELOVRD_NORMAL_XTAL;
+}
+
+static uint32_t icl_readout_refclk() {
+	switch (NGreen::callback->readReg32(SKL_DSSM) & ICL_DSSM_CDCLK_PLL_REFCLK_MASK) {
+	case ICL_DSSM_CDCLK_PLL_REFCLK_19_2MHz: return 19200;
+	case ICL_DSSM_CDCLK_PLL_REFCLK_38_4MHz: return 38400;
+	default:                                return 24000;
 	}
 }
 
+/* intel_de_wait_for_set_ms / intel_de_wait_for_clear_ms, polled every microsecond */
+static bool intel_de_wait_ms(uint32_t reg, uint32_t mask, bool set, uint32_t ms) {
+	auto *cb = NGreen::callback;
+	for (uint32_t us = 0; us < ms * 1000u; us++) {
+		if (((cb->readReg32(reg) & mask) != 0) == set) return true;
+		IODelay(1);
+	}
+	return ((cb->readReg32(reg) & mask) != 0) == set;
+}
+
+static void icl_pll_power_enable(uint32_t enable_reg) {
+	NGreen::callback->intel_de_rmw(enable_reg, 0, PLL_POWER_ENABLE);
+	/* The spec says we need to "wait" but it also says it should be immediate. */
+	intel_de_wait_ms(enable_reg, PLL_POWER_STATE, true, 1);
+}
+
+static void icl_pll_enable(uint32_t enable_reg) {
+	NGreen::callback->intel_de_rmw(enable_reg, 0, PLL_ENABLE);
+	/* Timeout is actually 600us. */
+	intel_de_wait_ms(enable_reg, PLL_LOCK, true, 1);
+}
+
+static void icl_dpll_write(uint32_t cfgcr0, uint32_t cfgcr1) {
+	auto *cb = NGreen::callback;
+	cb->writeReg32(_TGL_DPLL0_CFGCR0, cfgcr0);
+	cb->writeReg32(_TGL_DPLL0_CFGCR1, cfgcr1);
+	(void)cb->readReg32(_TGL_DPLL0_CFGCR1);
+}
+
+static void combo_pll_enable(uint32_t enable_reg, uint32_t cfgcr0, uint32_t cfgcr1) {
+	icl_pll_power_enable(enable_reg);
+	icl_dpll_write(cfgcr0, cfgcr1);
+	/* DVFS pre sequence would be here, but the cdclk code paths should already be setting the voltage: nothing here. */
+	icl_pll_enable(enable_reg);
+	/* DVFS post sequence would be here. See the comment above. */
+}
+
+static void icl_pll_disable(uint32_t enable_reg) {
+	auto *cb = NGreen::callback;
+	/* The first steps are done by intel_ddi_post_disable(). */
+	cb->intel_de_rmw(enable_reg, PLL_ENABLE, 0);
+	/* Timeout is actually 1us. */
+	intel_de_wait_ms(enable_reg, PLL_LOCK, false, 1);
+	cb->intel_de_rmw(enable_reg, PLL_POWER_ENABLE, 0);
+	/* The spec says we need to "wait" but it also says it should be immediate. */
+	intel_de_wait_ms(enable_reg, PLL_POWER_STATE, false, 1);
+}
+
+// Apple's framebuffer leaves DPLL0 set for a lower rate than the one it then trains (boot #66: 3.24 Gbps under a 5.4 link), so before
+// its link training the PLL is set for the rate the sink will be asked for, in i915's order (icl_pll_disable, combo_pll_enable). i915
+// touches a PLL only after intel_ddi_post_disable has turned the port off; when Apple's port is still on the PLL is left alone. The 24 MHz
+// table is not carried: this platform's reference is 38.4 MHz (the BIOS's CFGCR0 0x00E001A5 holds the halved fraction).
 static void programDPLL0(uint8_t rateCode) {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || !cb->mmioMapped()) return;
 
-	constexpr uint32_t kDPLL0Enable = 0x46010u;
-	constexpr uint32_t kCfgcr0      = 0x164284u;
-	constexpr uint32_t kCfgcr1      = 0x164288u;
-	constexpr uint32_t kDdiBufCtlA  = 0x64000u;
-	constexpr uint32_t kPllEnable   = 1u << 31;
-	constexpr uint32_t kPllLock     = 1u << 30;
+	skl_wrpll_params pll_params = {};
+	const int port_clock = drm_dp_bw_code_to_link_rate(rateCode);
+	if (!icl_calc_dp_combo_pll(port_clock, pll_params)) return;
+	const uint32_t ref_clk = icl_readout_refclk();
+	if (ref_clk == 24000) return;
+	uint32_t cfgcr0 = 0, cfgcr1 = 0;
+	icl_calc_dpll_state(ref_clk, pll_params, cfgcr0, cfgcr1);
 
-	uint32_t wantC0 = 0, wantC1 = 0;
-	if (!dpllValuesFor(rateCode, wantC0, wantC1)) {
-		return;
-	}
+	const uint32_t curC0 = cb->readReg32(_TGL_DPLL0_CFGCR0);
+	const uint32_t curC1 = cb->readReg32(_TGL_DPLL0_CFGCR1);
+	if (curC0 == cfgcr0 && curC1 == cfgcr1) return;
+	if ((cb->readReg32(DDI_BUF_CTL_A) & DDI_BUF_CTL_ENABLE) != 0) return;
 
-	const uint32_t curC0 = cb->readReg32(kCfgcr0);
-	const uint32_t curC1 = cb->readReg32(kCfgcr1);
-	const uint32_t ddiA  = cb->readReg32(kDdiBufCtlA);
-
-	if (curC0 == wantC0 && curC1 == wantC1) {
-		return;
-	}
-
-	if ((ddiA & 0x80000000u) != 0) {
-		return;
-	}
-
-	cb->intel_de_rmw(kDPLL0Enable, kPllEnable, 0);
-	for (int i = 0; i < 1000; i++) {
-		if ((cb->readReg32(kDPLL0Enable) & kPllLock) == 0) break;
-		IODelay(1);
-	}
-
-	cb->writeReg32(kCfgcr0, wantC0);
-	cb->writeReg32(kCfgcr1, wantC1);
-
-	cb->intel_de_rmw(kDPLL0Enable, 0, kPllEnable);
-	for (int i = 0; i < 1000; i++) {
-		if ((cb->readReg32(kDPLL0Enable) & kPllLock) != 0) break;
-		IODelay(1);
-	}
+	icl_pll_disable(_DPLL0_ENABLE);
+	combo_pll_enable(_DPLL0_ENABLE, cfgcr0, cfgcr1);
+	const uint32_t en = cb->readReg32(_DPLL0_ENABLE);
+	SYSLOG("ngreen", "DPLL0 set for link rate code 0x%x (%d kHz, ref %u kHz): CFGCR0 0x%x -> 0x%x, CFGCR1 0x%x -> 0x%x, DPLL0_ENABLE 0x%x (power %u, lock %u)",
+	       rateCode, port_clock, ref_clk, curC0, cfgcr0, curC1, cfgcr1, en, (en & PLL_POWER_STATE) != 0 ? 1u : 0u, (en & PLL_LOCK) != 0 ? 1u : 0u);
 }
 
 static constexpr uint32_t kPhyA        = 0x162000u;
