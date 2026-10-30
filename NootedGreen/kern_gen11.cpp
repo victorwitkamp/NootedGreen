@@ -3781,17 +3781,14 @@ void Gen11::wrapDisableDSCEngine(AppleIntel::AppleIntelBaseController *that, App
 }
 
 static volatile uint32_t gTransFuncCtl = 0;
-static constexpr uint32_t kTransClkSelA     = 0x46140u;
-static constexpr uint32_t kTransDdiFuncCtlA = 0x60400u;
-static constexpr uint32_t kTransFuncEnable       = 0x80000000u;
-static constexpr uint32_t kTransFuncPortMask     = 0x78000000u;
-static constexpr uint32_t kTransFuncPortA        = 0x08000000u;
-static constexpr uint32_t kTransFuncModeMask     = 0x07000000u;
-static constexpr uint32_t kTransFuncModeDpSst    = 0x02000000u;
 
+// From i915, drivers/gpu/drm/i915/display/intel_ddi.c, intel_ddi_enable_transcoder_clock: on display 12 TRANS_CLK_SEL takes
+// TGL_TRANS_CLK_SEL_PORT(port). Here the port is the one a TRANS_DDI_FUNC_CTL value selects (its field holds port + 1); no port
+// selected leaves the clock TGL_TRANS_CLK_SEL_DISABLED.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L1043-L1062
 static inline uint32_t clkSelFromFuncCtl(uint32_t funcCtl) {
-	const uint32_t sel = (funcCtl & kTransFuncPortMask) >> 27;
-	return sel == 0 ? 0u : (sel << 28);
+	const uint32_t sel = (funcCtl & TGL_TRANS_DDI_PORT_MASK) >> TGL_TRANS_DDI_PORT_SHIFT;
+	return sel == 0 ? TGL_TRANS_CLK_SEL_DISABLED : TGL_TRANS_CLK_SEL_PORT(sel - 1u);
 }
 
 // V403: AppleIntelBaseController::SetupParams — post-call.
@@ -4397,17 +4394,22 @@ IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 	}
 	auto *cb = NGreen::callback;
 	if (cb != nullptr && cb->mmioMapped()) {
-		const uint32_t funcBefore = cb->readReg32(kTransDdiFuncCtlA);
+		// From i915, drivers/gpu/drm/i915/display/intel_ddi.c, in tgl_ddi_pre_enable_dp's order: intel_ddi_enable_transcoder_clock
+		// (TRANS_CLK_SEL from the port), then intel_ddi_config_transcoder_func (TRANS_DDI_FUNC_CTL with TRANS_DDI_FUNC_ENABLE clear).
+		// The value is the one Apple's SetupParams built, or port A / DP SST over the live register when Apple selected no port.
+		// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L662-L675
+		// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L2834-L2840
+		const uint32_t funcBefore = cb->readReg32(_TRANS_DDI_FUNC_CTL_A);
 		const uint32_t apple = gTransFuncCtl;
-		uint32_t funcWant;
-		if (apple != 0 && (apple & kTransFuncPortMask) != 0)
-			funcWant = apple & ~kTransFuncEnable;
+		uint32_t ctl;
+		if (apple != 0 && (apple & TGL_TRANS_DDI_PORT_MASK) != 0)
+			ctl = apple & ~TRANS_DDI_FUNC_ENABLE;
 		else
-			funcWant = (funcBefore & ~(kTransFuncEnable | kTransFuncPortMask | kTransFuncModeMask)) | kTransFuncPortA | kTransFuncModeDpSst;
-		cb->writeReg32(kTransClkSelA, clkSelFromFuncCtl(funcWant));
-		(void)cb->readReg32(kTransClkSelA);
-		cb->writeReg32(kTransDdiFuncCtlA, funcWant);
-		(void)cb->readReg32(kTransClkSelA);
+			ctl = (funcBefore & ~(TRANS_DDI_FUNC_ENABLE | TGL_TRANS_DDI_PORT_MASK | TRANS_DDI_MODE_SELECT_MASK)) | TGL_TRANS_DDI_SELECT_PORT(PORT_A) | TRANS_DDI_MODE_SELECT_DP_SST;
+		cb->writeReg32(_TRANS_CLK_SEL_A, clkSelFromFuncCtl(ctl));
+		(void)cb->readReg32(_TRANS_CLK_SEL_A);
+		cb->writeReg32(_TRANS_DDI_FUNC_CTL_A, ctl);
+		(void)cb->readReg32(_TRANS_CLK_SEL_A);
 	}
 	programDPLL0(getMember<uint8_t>(that, 0xf));
 	__sync_add_and_fetch(&gPhyTraining, 1u);

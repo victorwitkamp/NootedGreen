@@ -188,6 +188,21 @@ struct PACKED intel_dmc_header_v3 {
 #define DC_STATE_EN			(0x45504)
 #define CLKREQ_POLICY			(0x101038)
 #define  CLKREQ_POLICY_MEM_UP_OVRD	(1 << 1)
+// From i915, drivers/gpu/drm/i915/display/intel_display_regs.h: transcoder A's DDI function control and clock select, and
+// display/intel_display_limits.h: the port numbers.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2484-L2504
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2724-L2731
+enum port { PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E };
+#define _TRANS_DDI_FUNC_CTL_A		0x60400
+#define  TRANS_DDI_FUNC_ENABLE		(1 << 31)
+#define  TGL_TRANS_DDI_PORT_SHIFT	27
+#define  TGL_TRANS_DDI_PORT_MASK	(0xf << TGL_TRANS_DDI_PORT_SHIFT)
+#define  TGL_TRANS_DDI_SELECT_PORT(x)	(((x) + 1) << TGL_TRANS_DDI_PORT_SHIFT)
+#define  TRANS_DDI_MODE_SELECT_MASK	(7 << 24)
+#define  TRANS_DDI_MODE_SELECT_DP_SST	(2 << 24)
+#define _TRANS_CLK_SEL_A		0x46140
+#define  TGL_TRANS_CLK_SEL_DISABLED	(0x0 << 28)
+#define  TGL_TRANS_CLK_SEL_PORT(x)	(((x) + 1) << 28)
 #define GEN11_COMMON_SLICE_CHICKEN3		(0x7304)
 #define   GEN12_DISABLE_CPS_AWARE_COLOR_PIPE	(1 << 9)
 // Command Streamer chicken bits — GPU preemption granularity control
