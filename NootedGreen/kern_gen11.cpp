@@ -4352,21 +4352,9 @@ static void programDPLL0(uint8_t rateCode) {
 	       rateCode, port_clock, ref_clk, curC0, cfgcr0, curC1, cfgcr1, en, (en & PLL_POWER_STATE) != 0 ? 1u : 0u, (en & PLL_LOCK) != 0 ? 1u : 0u);
 }
 
-static constexpr uint32_t kPhyA        = 0x162000u;
-static constexpr uint32_t kPhyTxDw5Ln0    = kPhyA + 0x894u;
-static constexpr uint32_t kPhyTxDw5Grp    = kPhyA + 0x694u;
-static constexpr uint32_t kPhyTxDw2Ln0    = kPhyA + 0x888u;
 static constexpr uint32_t kPhyDpTpCtlA    = 0x60540u;
 static constexpr uint32_t kPhyDpTpStatusA = 0x60544u;
 
-static constexpr uint32_t kPhyLaneStride  = 0x100u;
-static constexpr uint32_t kPhyTxDw2Grp    = kPhyA + 0x688u;
-static constexpr uint32_t kPhyTxDw4Ln0    = kPhyA + 0x890u;
-static constexpr uint32_t kPhyTxDw7Ln0    = kPhyA + 0x89cu;
-static constexpr uint32_t kLoadgenSelect   = 1u << 31;
-static constexpr uint32_t kDw4CoeffMask    = 0x3FFFFu;
-static constexpr uint32_t kDw2ClearMask    = 0xffff4700u;
-static constexpr uint32_t kNScalarMask     = 0x7Fu << 24;
 
 static constexpr uint32_t kTxDw4UpperMask   = 0x7FFC0000u;
 static volatile uint32_t  gTxDw4Upper       = 0;
@@ -4428,15 +4416,9 @@ static constexpr uint32_t kPpsSinkAddrs[] = {
 	0x700, 0x701, 0x702, 0x703, 0x704, 0x705, 0x706, 0x707, 0x720, 0x721, 0x722, 0x723, 0x724, 0x725, 0x726, 0x727,
 };
 
-static constexpr uint32_t kTxTrainingEn    = 1u << 31;
-static constexpr uint32_t kTap2Disable     = 1u << 30;
-static constexpr uint32_t kTap3Disable     = 1u << 29;
-static constexpr uint32_t kCursorProgram   = 1u << 26;
-static constexpr uint32_t kCoeffPolarity   = 1u << 25;
-static constexpr uint32_t kScalingModeMask = 0x7u << 18;
-static constexpr uint32_t kRtermSelectMask = 0x7u << 3;
 
 static volatile uint32_t gPhyTraining = 0;
+static volatile uint32_t gLinkRateCode = 0;	// the DP_LINK_BW_SET code of the training in progress (the loadgen rule's port clock)
 static volatile uint32_t gPhyProbed   = 0;
 
 static constexpr uint32_t kDpTpCtlLinkTrainMask = 0x7u << 8;
@@ -4463,25 +4445,6 @@ static void dpclkaOneShot(void *that, AUXFn aux) {
 	}
 	W(kPhyDpTpCtlA, cur);
 	R(kPhyDpTpStatusA);
-}
-
-static void fixTxDw5() {
-	auto *cb = NGreen::callback;
-	if (cb == nullptr || !cb->mmioMapped()) return;
-
-	const uint32_t cur = cb->readReg32(kPhyTxDw5Ln0);
-
-	uint32_t want = cur;
-	want &= ~(kScalingModeMask | kRtermSelectMask | kCoeffPolarity | kCursorProgram |
-	          kTap2Disable | kTap3Disable);
-	want |= (2u << 18);
-	want |= (6u << 3);
-	want |= kTap3Disable;
-
-	if (want == cur) return;
-
-	cb->writeReg32(kPhyTxDw5Grp, want & ~kTxTrainingEn);
-	cb->writeReg32(kPhyTxDw5Grp, want | kTxTrainingEn);
 }
 
 IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
@@ -4576,6 +4539,7 @@ IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 		cb->writeReg32(_TRANS_DDI_FUNC_CTL_A, ctl);
 		(void)cb->readReg32(_TRANS_CLK_SEL_A);
 	}
+	gLinkRateCode = getMember<uint8_t>(that, 0xf);
 	programDPLL0(getMember<uint8_t>(that, 0xf));
 	__sync_add_and_fetch(&gPhyTraining, 1u);
 	const IOReturn ret = FunctionCast(wrapLinkTraining, callback->oLinkTraining)(that, config);
@@ -4618,61 +4582,132 @@ static int translate_signal_level(uint32_t swing, uint32_t preEmph) {
 	return kGrid[swing][preEmph];
 }
 
-static void fixDriveEntry(uint32_t swing, uint32_t preEmph, uint32_t laneCount) {
-	auto *cb = NGreen::callback;
-	if (cb == nullptr || !cb->mmioMapped()) return;
+static constexpr uint32_t EDP4K2K_MODE_OVRD_EN        = 1u << 3;
+static constexpr uint32_t EDP4K2K_MODE_OVRD_OPTIMIZED = 1u << 2;
+#define _ICL_PORT_CL_DW10(phy)	(_ICL_COMBOPHY(phy) + 0x028u)
+enum phy { PHY_A = 0 };
 
-	const int level = translate_signal_level(swing, preEmph);
-	if (level < 0) return;
-	const icl_ddi_buf_trans &e = _adls_combo_phy_trans_edp_hbr2[level];
+// From i915, drivers/gpu/drm/i915/display/intel_ddi.c: icl_combo_phy_loadgen_select, icl_ddi_combo_vswing_program and
+// icl_combo_phy_set_signal_levels, run after each swing / pre-emphasis step of Apple's trainer with the ADL-S eDP HBR2 table above
+// (adls_get_combo_buf_trans_edp's low-vswing choice for this 3.24 Gbps link). The registers are IntelDPLinkTraining.hpp's
+// (intel_combo_phy_regs.h's names). Not i915's: PORT_CL_DW10's eDP 4K2K override is cleared outright (ADL-S has no hobl table), and
+// the upper bits 30:18 of PORT_TX_DW4, which Apple's driver damages on one lane (boots #73-#74), are restored from a lane that still
+// holds them.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L1160-L1286
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi_buf_trans.c#L1620-L1631
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_combo_phy_regs.h#L24-L44
+static uint32_t icl_combo_phy_loadgen_select(int port_clock, uint32_t lane_count, uint32_t lane) {
+	if (port_clock > 600000)
+		return 0;
 
-	const uint32_t dw5 = cb->readReg32(kPhyTxDw5Ln0);
-	cb->writeReg32(kPhyTxDw5Grp, dw5 & ~kTxTrainingEn);
+	if (lane_count == 4)
+		return lane >= 1 ? LOADGEN_SELECT : 0;
+	else
+		return lane == 1 || lane == 2 ? LOADGEN_SELECT : 0;
+}
 
-	const uint32_t dw2cur = cb->readReg32(kPhyTxDw2Ln0);
-	const uint32_t dw2    = (dw2cur & kDw2ClearMask) | ((e.dw2_swing_sel & 0x8u) << 12) |
-	                        ((e.dw2_swing_sel & 0x7u) << 11) | 0x98u;
-	cb->writeReg32(kPhyTxDw2Grp, dw2);
-
-	const uint32_t coeff = (static_cast<uint32_t>(e.dw4_post_cursor_1) << 12) |
-	                       (static_cast<uint32_t>(e.dw4_post_cursor_2) << 6) |
-	                       static_cast<uint32_t>(e.dw4_cursor_coeff);
-	uint32_t txDw4Upper = 0;
-	bool     txDw4Have  = false;
-	if (gTxDw4UpperValid) {
-		txDw4Upper = gTxDw4Upper;
-		txDw4Have  = true;
-	} else {
-		for (uint32_t ln = 0; ln < 4; ln++) {
-			const uint32_t u = cb->readReg32(kPhyTxDw4Ln0 + ln * kPhyLaneStride) & kTxDw4UpperMask;
-			if (u != 0) {
-				txDw4Upper      = u;
-				txDw4Have       = true;
-				gTxDw4Upper     = u;
-				gTxDw4UpperValid = 1;
-				break;
-			}
+static void captureTxDw4Upper(uint8_t phy) {
+	if (gTxDw4UpperValid) return;
+	for (uint32_t ln = 0; ln < 4; ln++) {
+		const uint32_t u = NGreen::callback->readReg32(ICL_PORT_TX_DW4_LN(ln, phy)) & kTxDw4UpperMask;
+		if (u != 0) {
+			gTxDw4Upper = u;
+			gTxDw4UpperValid = 1;
+			return;
 		}
 	}
+}
 
+static void icl_ddi_combo_vswing_program(uint8_t phy, int level) {
+	auto *cb = NGreen::callback;
+	const icl_ddi_buf_trans &e = _adls_combo_phy_trans_edp_hbr2[level];
+	uint32_t val;
+
+	/* eDP: the 4K2K override follows the table; ADL-S has no hobl table, so it is off */
+	cb->intel_de_rmw(_ICL_PORT_CL_DW10(phy), EDP4K2K_MODE_OVRD_EN | EDP4K2K_MODE_OVRD_OPTIMIZED, 0);
+
+	/* Set PORT_TX_DW5 */
+	val = cb->readReg32(ICL_PORT_TX_DW5_LN(0, phy));
+	val &= ~(SCALING_MODE_SEL_MASK | RTERM_SELECT_MASK |
+		 COEFF_POLARITY | CURSOR_PROGRAM |
+		 TAP2_DISABLE | TAP3_DISABLE);
+	val |= SCALING_MODE_SEL(0x2);
+	val |= RTERM_SELECT(0x6);
+	val |= TAP3_DISABLE;
+	cb->writeReg32(ICL_PORT_TX_DW5_GRP(phy), val);
+
+	/* Program PORT_TX_DW2 */
 	for (uint32_t ln = 0; ln < 4; ln++) {
-		const uint32_t reg = kPhyTxDw4Ln0 + ln * kPhyLaneStride;
-		const uint32_t cur = cb->readReg32(reg);
-		const bool loadgen = (laneCount == 4) ? (ln >= 1) : (ln == 1 || ln == 2);
-		uint32_t want = (cur & ~kDw4CoeffMask) | coeff;
-		want = loadgen ? (want | kLoadgenSelect) : (want & ~kLoadgenSelect);
-		if (txDw4Have) want = (want & ~kTxDw4UpperMask) | txDw4Upper;
-		if (want != cur) cb->writeReg32(reg, want);
+		cb->intel_de_rmw(ICL_PORT_TX_DW2_LN(ln, phy),
+			     SWING_SEL_UPPER_MASK | SWING_SEL_LOWER_MASK | RCOMP_SCALAR_MASK,
+			     SWING_SEL_UPPER(e.dw2_swing_sel) |
+			     SWING_SEL_LOWER(e.dw2_swing_sel) |
+			     RCOMP_SCALAR_VAL);
 	}
 
+	/* Program PORT_TX_DW4 */
+	/* We cannot write to GRP. It would overwrite individual loadgen. */
 	for (uint32_t ln = 0; ln < 4; ln++) {
-		const uint32_t reg = kPhyTxDw7Ln0 + ln * kPhyLaneStride;
-		const uint32_t cur = cb->readReg32(reg);
-		const uint32_t want = (cur & ~kNScalarMask) | (static_cast<uint32_t>(e.dw7_n_scalar) << 24);
-		if (want != cur) cb->writeReg32(reg, want);
+		// the one read-modify-write i915 does, with the restore of the upper bits folded in
+		const uint32_t upperClr = gTxDw4UpperValid ? kTxDw4UpperMask : 0u;
+		cb->intel_de_rmw(ICL_PORT_TX_DW4_LN(ln, phy),
+			     POST_CURSOR_1_MASK | POST_CURSOR_2_MASK | CURSOR_COEFF_MASK | upperClr,
+			     POST_CURSOR_1(e.dw4_post_cursor_1) |
+			     POST_CURSOR_2(e.dw4_post_cursor_2) |
+			     CURSOR_COEFF(e.dw4_cursor_coeff) |
+			     (gTxDw4UpperValid ? gTxDw4Upper : 0u));
 	}
 
-	cb->writeReg32(kPhyTxDw5Grp, cb->readReg32(kPhyTxDw5Ln0) | kTxTrainingEn);
+	/* Program PORT_TX_DW7 */
+	for (uint32_t ln = 0; ln < 4; ln++) {
+		cb->intel_de_rmw(ICL_PORT_TX_DW7_LN(ln, phy),
+			     N_SCALAR_MASK,
+			     N_SCALAR(e.dw7_n_scalar));
+	}
+}
+
+static void icl_combo_phy_set_signal_levels(uint8_t phy, int port_clock, uint32_t lane_count, int level) {
+	auto *cb = NGreen::callback;
+	uint32_t val;
+
+	/*
+	 * 1. If port type is eDP or DP,
+	 * set PORT_PCS_DW1 cmnkeeper_enable to 1b,
+	 * else clear to 0b.
+	 */
+	val = cb->readReg32(ICL_PORT_PCS_DW1_LN(0, phy));
+	val |= COMMON_KEEPER_EN;
+	cb->writeReg32(ICL_PORT_PCS_DW1_GRP(phy), val);
+
+	/* 2. Program loadgen select */
+	/*
+	 * Program PORT_TX_DW4 depending on Bit rate and used lanes
+	 * <= 6 GHz and 4 lanes (LN0=0, LN1=1, LN2=1, LN3=1)
+	 * <= 6 GHz and 1,2 lanes (LN0=0, LN1=1, LN2=1, LN3=0)
+	 * > 6 GHz (LN0=0, LN1=0, LN2=0, LN3=0)
+	 */
+	for (uint32_t ln = 0; ln < 4; ln++) {
+		cb->intel_de_rmw(ICL_PORT_TX_DW4_LN(ln, phy),
+			     LOADGEN_SELECT,
+			     icl_combo_phy_loadgen_select(port_clock, lane_count, ln));
+	}
+
+	/* 3. Set PORT_CL_DW5 SUS Clock Config to 11b */
+	cb->intel_de_rmw(_ICL_PORT_CL_DW5(phy),
+		     0, SUS_CLOCK_CONFIG);
+
+	/* 4. Clear training enable to change swing values */
+	val = cb->readReg32(ICL_PORT_TX_DW5_LN(0, phy));
+	val &= ~TX_TRAINING_EN;
+	cb->writeReg32(ICL_PORT_TX_DW5_GRP(phy), val);
+
+	/* 5. Program swing and de-emphasis */
+	icl_ddi_combo_vswing_program(phy, level);
+
+	/* 6. Set training enable to trigger update */
+	val = cb->readReg32(ICL_PORT_TX_DW5_LN(0, phy));
+	val |= TX_TRAINING_EN;
+	cb->writeReg32(ICL_PORT_TX_DW5_GRP(phy), val);
 }
 
 IOReturn Gen11::wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, uint32_t preEmphasis,
@@ -4683,8 +4718,29 @@ IOReturn Gen11::wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, ui
 	if (gPhyTraining != 0) {
 		uint32_t lanes = getMember<uint32_t>(that, 0x124);
 		if (lanes != 1 && lanes != 2 && lanes != 4) lanes = 2;
-		fixDriveEntry(swing, preEmphasis, lanes);
-		fixTxDw5();
+		auto *cb = NGreen::callback;
+		const int level = translate_signal_level(swing, preEmphasis);
+		if (cb != nullptr && cb->mmioMapped() && level >= 0) {
+			const int port_clock = drm_dp_bw_code_to_link_rate(static_cast<uint8_t>(gLinkRateCode));
+			static volatile uint32_t rows = 0;
+			const uint32_t n = __sync_add_and_fetch(&rows, 1u);
+			uint32_t pcs0 = 0, cl5_0 = 0, cl10_0 = 0, lg0 = 0, lg1 = 0;
+			if (n <= 4) {
+				pcs0 = cb->readReg32(ICL_PORT_PCS_DW1_LN(0, PHY_A));
+				cl5_0 = cb->readReg32(_ICL_PORT_CL_DW5(PHY_A));
+				cl10_0 = cb->readReg32(_ICL_PORT_CL_DW10(PHY_A));
+				for (uint32_t ln = 0; ln < 4; ln++) lg0 |= ((cb->readReg32(ICL_PORT_TX_DW4_LN(ln, PHY_A)) >> 31) & 1u) << ln;
+			}
+			captureTxDw4Upper(PHY_A);
+			icl_combo_phy_set_signal_levels(PHY_A, port_clock, lanes, level);
+			if (n <= 4) {
+				for (uint32_t ln = 0; ln < 4; ln++) lg1 |= ((cb->readReg32(ICL_PORT_TX_DW4_LN(ln, PHY_A)) >> 31) & 1u) << ln;
+				SYSLOG("ngreen", "combo PHY A signal levels [%u]: level %d (swing %u pre-emphasis %u) lanes %u clock %d kHz; before PCS_DW1 0x%x CL_DW5 0x%x CL_DW10 0x%x loadgen 0x%x, after 0x%x 0x%x 0x%x loadgen 0x%x, DW5 0x%x, DW4 upper 0x%x",
+				       n, level, swing, preEmphasis, lanes, port_clock, pcs0, cl5_0, cl10_0, lg0,
+				       cb->readReg32(ICL_PORT_PCS_DW1_LN(0, PHY_A)), cb->readReg32(_ICL_PORT_CL_DW5(PHY_A)), cb->readReg32(_ICL_PORT_CL_DW10(PHY_A)), lg1,
+				       cb->readReg32(ICL_PORT_TX_DW5_LN(0, PHY_A)), gTxDw4Upper);
+			}
+		}
 	}
 	return ret;
 }
