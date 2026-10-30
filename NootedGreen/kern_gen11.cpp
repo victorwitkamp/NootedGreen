@@ -11,6 +11,7 @@
 #include "IntelDPLinkTraining.hpp"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOCatalogue.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/IOLib.h>
 #include <i386/proc_reg.h>
 #include <kern/thread_call.h>
@@ -2577,6 +2578,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", hwSetPowerWellStatePGE, this->ohwSetPowerWellStatePGE},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",hwSetPowerWellStateAux, this->ohwSetPowerWellStateAux},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
+			{"__ZN24AppleIntelBaseController14hwSetBacklightEj", hwSetBacklight, this->ohwSetBacklight},
 			{"__ZN31AppleIntelRegisterAccessManager19FastWriteRegister32Emj",FastWriteRegister32, this->oFastWriteRegister32},
 			// V60: ReadRegister32 hooks DISABLED — V59 proved they cause 0-children regression
 			// (display driver loops in forceWake power-well cycling, never completes init)
@@ -2620,6 +2622,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x89A36,
 			0x8B7DC,
 			0x8AD3A,
+			0x6C67C,
 			0x8DFB2,
 			0x8DCE6,
 			0x8DE14,
@@ -5413,6 +5416,381 @@ void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, b
 	}
 	getMember<void *>(that, 0x78) = ccont;
 	FunctionCast(hwSetPowerWellStateDDI, callback->ohwSetPowerWellStateDDI)(that,param_1,param_2);
+}
+
+// From Linux, lib/uuid.c: guid_parse, the first three fields of a GUID string stored little-endian, as _WDG stores them.
+// https://github.com/torvalds/linux/blob/65ba8f3/lib/uuid.c#L22
+// https://github.com/torvalds/linux/blob/65ba8f3/lib/uuid.c#L89-L127
+#define UUID_STRING_LEN 36
+static const uint8_t guid_index[16] = {3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15};
+
+static int hex_to_bin(char ch)
+{
+	if ((ch >= '0') && (ch <= '9'))
+		return ch - '0';
+	if ((ch >= 'a') && (ch <= 'f'))
+		return ch - 'a' + 10;
+	if ((ch >= 'A') && (ch <= 'F'))
+		return ch - 'A' + 10;
+	return -1;
+}
+
+static bool uuid_is_valid(const char *uuid)
+{
+	unsigned int i;
+
+	for (i = 0; i < UUID_STRING_LEN; i++) {
+		if (i == 8 || i == 13 || i == 18 || i == 23) {
+			if (uuid[i] != '-')
+				return false;
+		} else if (hex_to_bin(uuid[i]) < 0) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int __uuid_parse(const char *uuid, uint8_t b[16], const uint8_t ei[16])
+{
+	static const uint8_t si[16] = {0,2,4,6,9,11,14,16,19,21,24,26,28,30,32,34};
+	unsigned int i;
+
+	if (!uuid_is_valid(uuid))
+		return -EINVAL;
+
+	for (i = 0; i < 16; i++) {
+		int hi = hex_to_bin(uuid[si[i] + 0]);
+		int lo = hex_to_bin(uuid[si[i] + 1]);
+
+		b[ei[i]] = (hi << 4) | lo;
+	}
+
+	return 0;
+}
+
+static int guid_parse(const char *uuid, uint8_t b[16])
+{
+	return __uuid_parse(uuid, b, guid_index);
+}
+
+// From Linux, drivers/platform/wmi/core.c: a PNP0C14 device's _WDG lists its WMI blocks (parse_wdg); a method block is evaluated as
+// WM + the block's object id with the instance, the method id and the input buffer (wmidev_evaluate_method). Only what
+// nvidia-wmi-ec-backlight needs is here: the block is looked up by GUID directly (wmi_find_device_by_guid without the bus), and an
+// integer result is laid into the output buffer as ACPICA lays out an integer object (the type, then the 64-bit value at offset 8).
+// IOReturn takes acpi_status's place.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/wmi/core.c#L43-L54
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/wmi/core.c#L88
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/wmi/core.c#L134-L145
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/wmi/core.c#L211-L226
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/wmi/core.c#L319-L364
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/wmi/core.c#L1291-L1323
+#define ACPI_WMI_METHOD	0x2	/* GUID is a method */
+#define WMI_ACPI_METHOD_NAME_SIZE 5
+
+struct PACKED guid_block {
+	uint8_t guid[16];
+	char object_id[2];
+	uint8_t instance_count;
+	uint8_t flags;
+};
+static_assert(sizeof(struct guid_block) == 20, "guid_block");
+
+struct wmi_block {
+	struct guid_block gblock;
+	IOACPIPlatformDevice *acpi_device;
+};
+
+struct acpi_buffer {
+	size_t length;
+	void *pointer;
+};
+
+static inline void get_acpi_method_name(const struct wmi_block *wblock, const char method, char buffer[WMI_ACPI_METHOD_NAME_SIZE])
+{
+	buffer[0] = 'W';
+	buffer[1] = method;
+	buffer[2] = wblock->gblock.object_id[0];
+	buffer[3] = wblock->gblock.object_id[1];
+	buffer[4] = '\0';
+}
+
+static int wmi_find_device_by_guid(const char *guid_string, struct wmi_block *wblock)
+{
+	uint8_t guid[16];
+	OSDictionary *matching;
+	OSIterator *it;
+	OSObject *obj;
+	int ret;
+
+	ret = guid_parse(guid_string, guid);
+	if (ret < 0)
+		return ret;
+
+	matching = IOService::nameMatching("PNP0C14");
+	it = matching ? IOService::getMatchingServices(matching) : nullptr;
+	OSSafeReleaseNULL(matching);
+	if (!it)
+		return -ENODEV;
+
+	ret = -ENODEV;
+	while (ret && (obj = it->getNextObject())) {
+		IOACPIPlatformDevice *device = OSDynamicCast(IOACPIPlatformDevice, obj);
+		const struct guid_block *gblock;
+		OSObject *out = nullptr;
+		OSData *buffer;
+		uint32_t i, total;
+
+		if (!device || device->evaluateObject("_WDG", &out) != kIOReturnSuccess)
+			continue;
+
+		buffer = OSDynamicCast(OSData, out);
+		gblock = buffer ? static_cast<const struct guid_block *>(buffer->getBytesNoCopy()) : nullptr;
+		total = buffer ? buffer->getLength() / sizeof(struct guid_block) : 0;
+
+		for (i = 0; i < total; i++) {
+			if (!gblock[i].instance_count || memcmp(gblock[i].guid, guid, sizeof(guid)))
+				continue;
+
+			device->retain();
+			wblock->acpi_device = device;
+			wblock->gblock = gblock[i];
+			ret = 0;
+			break;
+		}
+		OSSafeReleaseNULL(out);
+	}
+	it->release();
+
+	return ret;
+}
+
+static IOReturn wmidev_evaluate_method(struct wmi_block *wblock, uint8_t instance, uint32_t method_id,
+				       const struct acpi_buffer *in, struct acpi_buffer *out)
+{
+	const struct guid_block *block = &wblock->gblock;
+	char method[WMI_ACPI_METHOD_NAME_SIZE];
+	OSObject *params[3];
+	OSObject *result = nullptr;
+	OSNumber *integer;
+	IOReturn status;
+
+	if (!in)
+		return kIOReturnBadArgument;
+
+	if (!(block->flags & ACPI_WMI_METHOD))
+		return kIOReturnBadArgument;
+
+	if (block->instance_count <= instance)
+		return kIOReturnBadArgument;
+
+	params[0] = OSNumber::withNumber(instance, 32);
+	params[1] = OSNumber::withNumber(method_id, 32);
+	params[2] = OSData::withBytes(in->pointer, static_cast<unsigned int>(in->length));
+
+	get_acpi_method_name(wblock, 'M', method);
+
+	status = params[0] && params[1] && params[2] ? wblock->acpi_device->evaluateObject(method, &result, params, 3) : kIOReturnNoMemory;
+	for (OSObject *param : params)
+		OSSafeReleaseNULL(param);
+
+	integer = OSDynamicCast(OSNumber, result);
+	if (status == kIOReturnSuccess && out && integer && out->length >= 16) {
+		const uint32_t type = 1;	/* ACPI_TYPE_INTEGER */
+		const uint64_t value = integer->unsigned64BitValue();
+
+		memcpy(out->pointer, &type, sizeof(type));
+		memcpy(static_cast<uint8_t *>(out->pointer) + 8, &value, sizeof(value));
+	}
+	OSSafeReleaseNULL(result);
+
+	return status;
+}
+
+// From Linux, include/linux/platform_data/x86/nvidia-wmi-ec-backlight.h.
+// https://github.com/torvalds/linux/blob/65ba8f3/include/linux/platform_data/x86/nvidia-wmi-ec-backlight.h#L9
+// https://github.com/torvalds/linux/blob/65ba8f3/include/linux/platform_data/x86/nvidia-wmi-ec-backlight.h#L16-L74
+#define WMI_BRIGHTNESS_GUID "603E9613-EF25-4338-A3D0-C46177516DB7"
+
+enum wmi_brightness_method {
+	WMI_BRIGHTNESS_METHOD_LEVEL = 1,
+	WMI_BRIGHTNESS_METHOD_SOURCE = 2,
+	WMI_BRIGHTNESS_METHOD_MAX
+};
+
+enum wmi_brightness_mode {
+	WMI_BRIGHTNESS_MODE_GET = 0,
+	WMI_BRIGHTNESS_MODE_SET = 1,
+	WMI_BRIGHTNESS_MODE_GET_MAX_LEVEL = 2,
+	WMI_BRIGHTNESS_MODE_MAX
+};
+
+enum wmi_brightness_source {
+	WMI_BRIGHTNESS_SOURCE_GPU = 1,
+	WMI_BRIGHTNESS_SOURCE_EC = 2,
+	WMI_BRIGHTNESS_SOURCE_AUX = 3,
+	WMI_BRIGHTNESS_SOURCE_MAX
+};
+
+struct wmi_brightness_args {
+	uint32_t mode;
+	uint32_t val;
+	uint32_t ret;
+	uint32_t ignored[3];
+};
+
+// From Linux, drivers/acpi/video_detect.c: the EC drives the backlight when the WMI method's source answers EC; Linux then uses
+// nvidia-wmi-ec-backlight instead of the GPU's backlight, as it does on this laptop in hybrid mode (intel_backlight is not registered).
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/acpi/video_detect.c#L82-L102
+static bool nvidia_wmi_ec_supported(struct wmi_block *w)
+{
+	struct wmi_brightness_args args = {};
+	struct acpi_buffer buf = { (size_t)sizeof(args), &args };
+	IOReturn status;
+
+	args.mode = WMI_BRIGHTNESS_MODE_GET;
+	args.val = 0;
+	args.ret = 0;
+
+	status = wmidev_evaluate_method(w, 0, WMI_BRIGHTNESS_METHOD_SOURCE, &buf, &buf);
+	if (status != kIOReturnSuccess)
+		return false;
+
+	/*
+	 * If brightness is handled by the EC then nvidia-wmi-ec-backlight
+	 * should be used, else the GPU driver(s) should be used.
+	 */
+	return args.ret == WMI_BRIGHTNESS_SOURCE_EC;
+}
+
+// From Linux, drivers/platform/x86/nvidia-wmi-ec-backlight.c. The backlight class device is not there: the probe reads the maximum and
+// the current level into the two properties update_status uses.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/x86/nvidia-wmi-ec-backlight.c#L31-L68
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/platform/x86/nvidia-wmi-ec-backlight.c#L90-L123
+struct backlight_properties {
+	uint32_t brightness;
+	uint32_t max_brightness;
+};
+
+static int wmi_brightness_notify(struct wmi_block *w, enum wmi_brightness_method id, enum wmi_brightness_mode mode, uint32_t *val)
+{
+	struct wmi_brightness_args args = {};
+	struct acpi_buffer buf = { (size_t)sizeof(args), &args };
+	IOReturn status;
+
+	args.mode = mode;
+	args.val = 0;
+	args.ret = 0;
+
+	if (id < WMI_BRIGHTNESS_METHOD_LEVEL ||
+	    id >= WMI_BRIGHTNESS_METHOD_MAX ||
+	    mode < WMI_BRIGHTNESS_MODE_GET || mode >= WMI_BRIGHTNESS_MODE_MAX)
+		return -EINVAL;
+
+	if (mode == WMI_BRIGHTNESS_MODE_SET)
+		args.val = *val;
+
+	status = wmidev_evaluate_method(w, 0, id, &buf, &buf);
+	if (status != kIOReturnSuccess) {
+		static volatile uint32_t rows = 0;
+		if (__sync_add_and_fetch(&rows, 1u) <= 8u)
+			SYSLOG("ngreen", "EC backlight control failed: 0x%x", status);
+		return -EIO;
+	}
+
+	if (mode != WMI_BRIGHTNESS_MODE_SET)
+		*val = args.ret;
+
+	return 0;
+}
+
+static int nvidia_wmi_ec_backlight_update_status(struct wmi_block *wdev, struct backlight_properties *props)
+{
+	return wmi_brightness_notify(wdev, WMI_BRIGHTNESS_METHOD_LEVEL,
+				     WMI_BRIGHTNESS_MODE_SET,
+				     &props->brightness);
+}
+
+static int nvidia_wmi_ec_backlight_probe(struct wmi_block *wdev, struct backlight_properties *props)
+{
+	int ret;
+
+	/* drivers/acpi/video_detect.c also checks that SOURCE == EC */
+	if (!nvidia_wmi_ec_supported(wdev))
+		return -ENODEV;
+
+	ret = wmi_brightness_notify(wdev, WMI_BRIGHTNESS_METHOD_LEVEL,
+				    WMI_BRIGHTNESS_MODE_GET_MAX_LEVEL,
+				    &props->max_brightness);
+	if (ret)
+		return ret;
+
+	ret = wmi_brightness_notify(wdev, WMI_BRIGHTNESS_METHOD_LEVEL,
+				    WMI_BRIGHTNESS_MODE_GET, &props->brightness);
+	if (ret)
+		return ret;
+
+	return props->max_brightness ? 0 : -ENODEV;
+}
+
+// Apple's hwSetBacklight writes only the PWM duty, which the EC does not follow. After it, the same level (IODisplayParameters' bklt,
+// 0..0xffff) is scaled to max_brightness and sent through update_status from a thread call, outside Apple's caller; the newest level
+// wins. The WMI block is looked up and probed once, at the first level.
+static struct wmi_block nvidia_wmi_ec_backlight;
+static struct backlight_properties nvidia_wmi_ec_backlight_props;
+static volatile int nvidia_wmi_ec_backlight_state;	// 0 not probed yet, 1 the level follows Apple's, -1 not used
+static volatile uint32_t nvidia_wmi_ec_backlight_level;
+static thread_call_t nvidia_wmi_ec_backlight_call;
+
+static void nvidia_wmi_ec_backlight_update(thread_call_param_t lock, thread_call_param_t)
+{
+	IOLockLock(static_cast<IOLock *>(lock));
+	if (nvidia_wmi_ec_backlight_state == 0) {
+		const int err = wmi_find_device_by_guid(WMI_BRIGHTNESS_GUID, &nvidia_wmi_ec_backlight);
+		char method[WMI_ACPI_METHOD_NAME_SIZE] = "none";
+		uint32_t source = 0;
+
+		if (!err) {
+			get_acpi_method_name(&nvidia_wmi_ec_backlight, 'M', method);
+			wmi_brightness_notify(&nvidia_wmi_ec_backlight, WMI_BRIGHTNESS_METHOD_SOURCE, WMI_BRIGHTNESS_MODE_GET, &source);
+		}
+		const int ret = err ? err : nvidia_wmi_ec_backlight_probe(&nvidia_wmi_ec_backlight, &nvidia_wmi_ec_backlight_props);
+		nvidia_wmi_ec_backlight_state = ret ? -1 : 1;
+		SYSLOG("ngreen", "EC backlight: %s (%d); WMI method %s, source %u (EC = 2), max %u, level %u",
+		       ret ? "not used" : "the level follows Apple's", ret, method, source, nvidia_wmi_ec_backlight_props.max_brightness,
+		       nvidia_wmi_ec_backlight_props.brightness);
+	}
+	if (nvidia_wmi_ec_backlight_state > 0) {
+		const uint32_t level = nvidia_wmi_ec_backlight_level > 0xffff ? 0xffff : nvidia_wmi_ec_backlight_level;
+		auto &props = nvidia_wmi_ec_backlight_props;
+		props.brightness = static_cast<uint32_t>((static_cast<uint64_t>(level) * props.max_brightness + 0x7fff) / 0xffff);
+		const int ret = nvidia_wmi_ec_backlight_update_status(&nvidia_wmi_ec_backlight, &props);
+		static uint32_t rows = 0;
+		if (++rows <= 8)
+			SYSLOG("ngreen", "EC backlight: level 0x%x of 0xffff -> %u of %u (%d)", level, props.brightness, props.max_brightness, ret);
+	}
+	IOLockUnlock(static_cast<IOLock *>(lock));
+}
+
+IOReturn Gen11::hwSetBacklight(AppleIntel::AppleIntelBaseController *that, uint32_t level)
+{
+	const IOReturn ret = FunctionCast(hwSetBacklight, callback->ohwSetBacklight)(that, level);
+	if (IS_RAPTOR_LAKE_HX() && nvidia_wmi_ec_backlight_state >= 0) {
+		if (!nvidia_wmi_ec_backlight_call) {
+			IOLock *lock = IOLockAlloc();
+			thread_call_t call = lock ? thread_call_allocate(nvidia_wmi_ec_backlight_update, lock) : nullptr;
+			if (!call || !__sync_bool_compare_and_swap(&nvidia_wmi_ec_backlight_call, nullptr, call)) {
+				if (call)
+					thread_call_free(call);
+				if (lock)
+					IOLockFree(lock);
+			}
+		}
+		nvidia_wmi_ec_backlight_level = level;
+		if (nvidia_wmi_ec_backlight_call)
+			thread_call_enter(nvidia_wmi_ec_backlight_call);
+	}
+	return ret;
 }
 
 // From i915, drivers/gpu/drm/i915/display/intel_fifo_underrun.c, bdw_set_fifo_underrun_reporting: GEN8_PIPE_FIFO_UNDERRUN is

@@ -1809,6 +1809,9 @@ private:
 	
 	static void hwSetPowerWellStateAux(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2);
 	mach_vm_address_t ohwSetPowerWellStateAux {};
+
+	static IOReturn hwSetBacklight(AppleIntel::AppleIntelBaseController *that, uint32_t level);
+	mach_vm_address_t ohwSetBacklight {};
 	
 	
 	
