@@ -62,11 +62,13 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 
 Gen11 *Gen11::callback = nullptr;
 
-static constexpr uint32_t kGen11CsbWritePtrMask = 0xFu;
-static constexpr uint32_t kGen11CsbReadPtrMask  = 0xFu << 8;
+// From i915, drivers/gpu/drm/i915/gt/intel_lrc_reg.h: the pointer fields of RING_CONTEXT_STATUS_PTR. Moving the read pointer onto the
+// write pointer, as a masked write (the form reset_csb_pointers writes the register in), consumes every pending status entry.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_lrc_reg.h#L69-L72
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_execlists_submission.c#L2797-L2837
 static uint32_t csbConsumeWritePtr(uint32_t value) {
-	const uint32_t write = value & kGen11CsbWritePtrMask;
-	return (kGen11CsbReadPtrMask << 16) | (write << 8);
+	const uint32_t write = value & GEN11_CSB_WRITE_PTR_MASK;
+	return _MASKED_FIELD(GEN11_CSB_READ_PTR_MASK, write << 8);
 }
 
 static volatile UInt32 gIrqWatchdogStop = 1;
@@ -8215,8 +8217,8 @@ bool Gen11::stopGraphicsEngine(void *that)
 			NGreen::callback->writeReg32(RING_EMR(BLT_RING_BASE),    0xFFFFFFFF);
 			// Drain CSB: advance read pointer to write pointer
 			uint32_t csbReg   = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
-			uint32_t csbWrite = csbReg & kGen11CsbWritePtrMask;
-			uint32_t csbRead  = (csbReg & kGen11CsbReadPtrMask) >> 8;
+			uint32_t csbWrite = csbReg & GEN11_CSB_WRITE_PTR_MASK;
+			uint32_t csbRead  = (csbReg & GEN11_CSB_READ_PTR_MASK) >> 8;
 			if (csbRead != csbWrite)
 				NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE),
 											 csbConsumeWritePtr(csbReg));

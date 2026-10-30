@@ -19,4 +19,10 @@
 #define CTX_PDP0_UDW        (0x30 + 1)
 #define CTX_PDP0_LDW        (0x32 + 1)
 
+// The CSB pointer fields of RING_CONTEXT_STATUS_PTR:
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_lrc_reg.h#L69-L72
+#define GEN11_CSB_PTR_MASK 0xf
+#define GEN11_CSB_READ_PTR_MASK		(GEN11_CSB_PTR_MASK << 8)
+#define GEN11_CSB_WRITE_PTR_MASK	(GEN11_CSB_PTR_MASK << 0)
+
 #endif
