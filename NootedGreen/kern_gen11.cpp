@@ -340,6 +340,12 @@ static const i915_wa kContextWa[kWaCount] = {
 	{GEN8_WM_CHICKEN2,            kWaMcrWriteOr,     0u,                            WAIT_ON_DEPTH_STALL_DONE_DISABLE,               "WMCHK2"},
 	{GEN10_SAMPLER_MODE,          kWaMaskedEn,       0u,                            ENABLE_SMALLPL,                                 "SMP"},
 };
+// The value a context-image slot takes for a workaround row: i915 appends its own MI_LOAD_REGISTER_IMM after the golden context
+// (intel_engine_emit_ctx_wa: a masked row's value is REG_MASKED_FIELD_ENABLE(set) or REG_MASKED_FIELD(clr, set), an OR row reads the
+// live register), so the golden image's value is applied first and i915's masked write after it. This driver patches the one slot the
+// golden image has, so the slot takes the merge of the two: the golden value with i915's bits and their mask bits added. Dropping the
+// golden bits would be the change.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_workarounds.c#L992-L1065
 static uint32_t waNewValue(const i915_wa &w, uint32_t old) {
 	switch (w.kind) {
 	case kWaMaskedEn:       return old | w.set | (w.set << 16);
