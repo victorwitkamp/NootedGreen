@@ -1331,9 +1331,10 @@ static volatile uint32_t gFlipCacheMs[3] = {};
 static volatile uint32_t gFlipRequests = 0, gReflips = 0;
 static volatile uint32_t gNotReadyRunStartMs = 0, gLastReflipMs = 0, gInReflip = 0;
 
+// The primary plane's surface base of a pipe, as i915's PLANE_SURF(pipe, PLANE_1) reads it (skl_universal_plane_regs.h).
 static uint32_t readPlaneSurf(int32_t idx) {
 	if (idx < 0 || idx > 2 || NGreen::callback == nullptr || !NGreen::callback->mmioMapped()) return 0;
-	return NGreen::callback->readReg32(0x7019Cu + static_cast<uint32_t>(idx) * 0x1000u) & ~0xfffu;
+	return NGreen::callback->readReg32(PLANE_SURF(static_cast<uint32_t>(idx), PLANE_1)) & PLANE_SURF_ADDR_MASK;
 }
 static bool displayPipeIdle(const uint8_t *p) {
 	return *reinterpret_cast<const int32_t *>(p + 0x238) == *reinterpret_cast<const int32_t *>(p + 0x23c) &&

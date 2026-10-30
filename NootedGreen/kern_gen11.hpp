@@ -557,6 +557,23 @@ __typeof(divisor) __d = divisor;			\
 #define GEN8_DE_PIPE_IMR_C  (0x44424)
 #define GEN8_DE_PIPE_IIR_C  (0x44428)
 #define GEN8_DE_PIPE_IER_C  (0x4442c)
+// A plane's surface base register (display/skl_universal_plane_regs.h) and the plane numbers (display/intel_display_limits.h):
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_reg_defs.h#L51-L52
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/skl_universal_plane_regs.h#L11-L16
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/skl_universal_plane_regs.h#L153-L160
+enum plane_id { PLANE_1 = 0, PLANE_2, PLANE_3 };
+#define _PIPE(pipe, a, b)		_PICK_EVEN(pipe, a, b)
+#define _PLANE(plane, a, b)		_PICK_EVEN(plane, a, b)
+#define _SKL_PLANE(pipe, plane, reg_1_a, reg_1_b, reg_2_a, reg_2_b) \
+	_PLANE((plane), _PIPE((pipe), (reg_1_a), (reg_1_b)), _PIPE((pipe), (reg_2_a), (reg_2_b)))
+#define _PLANE_SURF_1_A				0x7019c
+#define _PLANE_SURF_2_A				0x7029c
+#define _PLANE_SURF_1_B				0x7119c
+#define _PLANE_SURF_2_B				0x7129c
+#define PLANE_SURF(pipe, plane)		_SKL_PLANE((pipe), (plane), \
+							_PLANE_SURF_1_A, _PLANE_SURF_1_B, \
+							_PLANE_SURF_2_A, _PLANE_SURF_2_B)
+#define   PLANE_SURF_ADDR_MASK			REG_GENMASK(31, 12)
 
 
 
