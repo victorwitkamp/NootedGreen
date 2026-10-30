@@ -216,6 +216,8 @@ enum port { PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E };
 #define GEN11_COMMON_SLICE_CHICKEN3		(0x7304)
 #define   GEN12_DISABLE_CPS_AWARE_COLOR_PIPE	(1 << 9)
 // Command Streamer chicken bits — GPU preemption granularity control
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L342
+#define GEN12_CCS_AUX_INV			(0x4208)
 #define GEN8_CS_CHICKEN1			(0x2580)
 #define   GEN9_PREEMPT_3D_OBJECT_LEVEL		(1 << 0)
 #define   GEN9_PREEMPT_GPGPU_LEVEL(hi, lo)	(((hi) << 2) | ((lo) << 1))

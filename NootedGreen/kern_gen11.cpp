@@ -3,6 +3,7 @@
 #include "kern_gen11.hpp"
 #include "i915_lrc_reg.hpp"
 #include "drm_dp.hpp"
+#include "intel_gpu_commands.hpp"
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -281,7 +282,7 @@ static void patchL3Batch(uint64_t pml4, uint64_t bva) {
 	if (p == nullptr) return;
 	flushLines(p, n * 4u);
 	for (uint32_t i = 0; i + 2 < n; i++) {
-		if (p[i] != 0x11000001u || p[i + 1] != kL3AllocReg) continue;
+		if (p[i] != MI_LOAD_REGISTER_IMM(1) || p[i + 1] != kL3AllocReg) continue;
 		const uint32_t was = p[i + 2];
 		if (was == kAppleL3) {
 			p[i + 2] = kMesaL3;
@@ -291,7 +292,6 @@ static void patchL3Batch(uint64_t pml4, uint64_t bva) {
 	}
 }
 
-static constexpr uint32_t kBatchEnd = 0x05000000u;
 static uint32_t cmdLen(uint32_t dw) {
 	const uint32_t type = dw >> 29;
 	if (type == 0) {
@@ -648,7 +648,7 @@ static constexpr uint32_t kResolveMaxDw = 1024;
 static void setScopedFastClear(uint64_t pml4, uint64_t bva) {
 	uint32_t w[16];
 	if (readPpgtt(pml4, bva & ~3ull, 8, w) < 8) return;
-	if (w[0] != 0x7a000004u || w[6] != 0x69041310u) return;
+	if (w[0] != GFX_OP_PIPE_CONTROL(6) || w[6] != 0x69041310u) return;
 	uint64_t ssb = 0;
 	uint32_t btp = 0, dw6 = 0, off = 0, psOff = 0;
 	bool ssbSet = false, btpSet = false, ps = false, ended = false;
@@ -656,7 +656,7 @@ static void setScopedFastClear(uint64_t pml4, uint64_t bva) {
 		const uint32_t got = readPpgtt(pml4, (bva & ~3ull) + off * 4ull, 16, w);
 		if (got == 0) break;
 		const uint32_t dw = w[0];
-		if (dw == kBatchEnd) { ended = true; break; }
+		if (dw == MI_BATCH_BUFFER_END) { ended = true; break; }
 		if (dw == 0) { off++; continue; }
 		const uint32_t len = cmdLen(dw);
 		if (len == 0) break;
@@ -708,15 +708,15 @@ static void patchPendingBatches(void *cs) {
 		for (uint32_t k = 0; k < kL3RingDw; k++) {
 			uint32_t dw = 0;
 			if (!ringDw(cb, start, off, dw, cPage, cPa)) break;
-			if (dw == 0x11000001u) {
+			if (dw == MI_LOAD_REGISTER_IMM(1)) {
 				uint32_t reg = 0, val = 0;
-				if (ringDw(cb, start, (off + 4u) & (size - 1u), reg, cPage, cPa) && ringDw(cb, start, (off + 8u) & (size - 1u), val, cPage, cPa) && reg == 0x4208u && val == 1u) {
+				if (ringDw(cb, start, (off + 4u) & (size - 1u), reg, cPage, cPa) && ringDw(cb, start, (off + 8u) & (size - 1u), val, cPage, cPa) && reg == GEN12_CCS_AUX_INV && val == 1u) {
 					off = (off + 12u) & (size - 1u);
 					k += 2;
 					continue;
 				}
 			}
-			if ((dw & 0xFF8001FFu) == 0x18800101u) {
+			if ((dw & 0xFF8001FFu) == (MI_BATCH_BUFFER_START_GEN8 | (1u << 8))) {
 				uint32_t lo = 0, hi = 0;
 				if (ringDw(cb, start, (off + 4u) & (size - 1u), lo, cPage, cPa) && ringDw(cb, start, (off + 8u) & (size - 1u), hi, cPage, cPa)) {
 					const uint64_t bva = (static_cast<uint64_t>(hi & 0xffffu) << 32) | (lo & ~3u);
@@ -727,7 +727,7 @@ static void patchPendingBatches(void *cs) {
 				k += 2;
 				continue;
 			}
-			if ((dw & 0xFF8001FFu) == 0x18800001u) {
+			if ((dw & 0xFF8001FFu) == MI_BATCH_BUFFER_START_GEN8) {
 				off = (off + 12u) & (size - 1u);
 				k += 2;
 				continue;
