@@ -1498,45 +1498,81 @@ IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
 
 static bool gAuxSeen = false;
 
-static constexpr uint32_t kDssCtl1A  = 0x78000u;
-static constexpr uint32_t kDssCtl2A  = 0x78004u;
+// From i915, drivers/gpu/drm/i915/display/intel_vdsc.c: intel_dsc_pps_write (one value to every VDSC engine of the pipe),
+// intel_dsc_pps_configure (PPS 0-10 and 16, the RC buffer thresholds, the RC range parameters, in that order), intel_dsc_enable (the
+// configuration, then DSS_CTL1 and DSS_CTL2) and intel_dsc_disable (DSS_CTL1 and DSS_CTL2 cleared). The values are Apple's, latched from
+// its CRTC parameters (i915 computes them from drm_dsc_config); the engine count comes off Apple's DSS_CTL2 as i915 takes it off the
+// state (vdsc_per_pipe). The registers: display/intel_vdsc_regs.h (pipe A's block sits 0x200 below pipe B's, DSC1's 0x100 above
+// DSC0's); the pipe and DDI enables: display/intel_display_regs.h.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc.c#L505-L521
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc.c#L523-L778
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc.c#L875-L926
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc_regs.h#L14-L81
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc_regs.h#L216-L224
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc_regs.h#L267-L275
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L869-L873
+enum pipe { PIPE_A = 0, PIPE_B, PIPE_C, PIPE_D };	/* display/intel_display_limits.h */
+static constexpr uint32_t _ICL_PIPE_DSS_CTL1_PB = 0x78200u, _ICL_PIPE_DSS_CTL1_PC = 0x78400u;
+static constexpr uint32_t _ICL_PIPE_DSS_CTL2_PB = 0x78204u, _ICL_PIPE_DSS_CTL2_PC = 0x78404u;
+#define ICL_PIPE_DSS_CTL1(pipe)	_PICK_EVEN((pipe) - PIPE_B, _ICL_PIPE_DSS_CTL1_PB, _ICL_PIPE_DSS_CTL1_PC)
+#define ICL_PIPE_DSS_CTL2(pipe)	_PICK_EVEN((pipe) - PIPE_B, _ICL_PIPE_DSS_CTL2_PB, _ICL_PIPE_DSS_CTL2_PC)
+static constexpr uint32_t JOINER_ENABLE = 1u << 30;
+static constexpr uint32_t VDSC0_ENABLE  = 1u << 31;
+static constexpr uint32_t VDSC1_ENABLE  = 1u << 15;
+static constexpr uint32_t _ICL_DSC0_PICTURE_PARAMETER_SET_0_PB = 0x78270u, _ICL_DSC0_PICTURE_PARAMETER_SET_0_PC = 0x78470u;
+static constexpr uint32_t _ICL_DSC1_PICTURE_PARAMETER_SET_0_PB = 0x78370u;
+#define _ICL_DSC0_PPS_0(pipe)	_PICK_EVEN((pipe) - PIPE_B, _ICL_DSC0_PICTURE_PARAMETER_SET_0_PB, _ICL_DSC0_PICTURE_PARAMETER_SET_0_PC)
+#define ICL_DSC0_PPS(pipe, pps)	(_ICL_DSC0_PPS_0(pipe) + ((pps) * 4))
+static constexpr uint32_t _ICL_DSC0_RC_BUF_THRESH_0_PB = 0x78254u, _ICL_DSC0_RC_BUF_THRESH_0_PC = 0x78454u;
+#define ICL_DSC0_RC_BUF_THRESH(pipe, n)	(_PICK_EVEN((pipe) - PIPE_B, _ICL_DSC0_RC_BUF_THRESH_0_PB, _ICL_DSC0_RC_BUF_THRESH_0_PC) + (n) * 4)
+static constexpr uint32_t _ICL_DSC0_RC_RANGE_PARAMETERS_0_PB = 0x78208u, _ICL_DSC0_RC_RANGE_PARAMETERS_0_PC = 0x78408u;
+#define ICL_DSC0_RC_RANGE_PARAMETERS(pipe, n)	(_PICK_EVEN((pipe) - PIPE_B, _ICL_DSC0_RC_RANGE_PARAMETERS_0_PB, _ICL_DSC0_RC_RANGE_PARAMETERS_0_PC) + (n) * 4)
+static constexpr uint32_t kVdscDsc1Offset = _ICL_DSC1_PICTURE_PARAMETER_SET_0_PB - _ICL_DSC0_PICTURE_PARAMETER_SET_0_PB;
+static constexpr uint32_t _TRANSACONF = 0x70008u;
+static constexpr uint32_t TRANSCONF_ENABLE = 1u << 31, TRANSCONF_STATE_ENABLE = 1u << 30;
 
 static volatile uint32_t gDssClearDone     = 0;
 
 static bool vdscFlushInForce();
 
+static void intel_dsc_disable() {
+	auto *cb = NGreen::callback;
+	cb->writeReg32(ICL_PIPE_DSS_CTL1(PIPE_A), 0);
+	cb->writeReg32(ICL_PIPE_DSS_CTL2(PIPE_A), 0);
+}
+
 static void clearDssOnce() {
 	if (vdscFlushInForce()) return;
 	if (__sync_val_compare_and_swap(&gDssClearDone, 0u, 1u) != 0u) return;
-	auto *cb = NGreen::callback;
-	if (cb == nullptr) return;
-	cb->writeReg32(kDssCtl1A, 0u);
-	cb->writeReg32(kDssCtl2A, 0u);
-	cb->readReg32(kDssCtl1A);
+	if (NGreen::callback == nullptr) return;
+	intel_dsc_disable();
 }
 
 static void clearVdscGatePipeOff() {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || !cb->mmioMapped()) return;
-	const uint32_t conf = cb->readReg32(0x70008u);
-	const uint32_t func = cb->readReg32(0x60400u);
-	const uint32_t p1   = cb->readReg32(kDssCtl1A);
-	const uint32_t p2   = cb->readReg32(kDssCtl2A);
-	const bool pipeOff  = (conf & 0xC0000000u) == 0u && (func & 0x80000000u) == 0u;
-	const bool gateSet  = (p1 & (1u << 30)) != 0u || (p2 & ((1u << 31) | (1u << 15))) != 0u;
-	if (gateSet && pipeOff) {
-		cb->writeReg32(kDssCtl1A, 0u);
-		cb->writeReg32(kDssCtl2A, 0u);
-		cb->readReg32(kDssCtl1A);
-	}
+	const uint32_t conf = cb->readReg32(_TRANSACONF);
+	const uint32_t func = cb->readReg32(_TRANS_DDI_FUNC_CTL_A);
+	const uint32_t p1   = cb->readReg32(ICL_PIPE_DSS_CTL1(PIPE_A));
+	const uint32_t p2   = cb->readReg32(ICL_PIPE_DSS_CTL2(PIPE_A));
+	const bool pipeOff  = (conf & (TRANSCONF_ENABLE | TRANSCONF_STATE_ENABLE)) == 0u && (func & TRANS_DDI_FUNC_ENABLE) == 0u;
+	const bool gateSet  = (p1 & JOINER_ENABLE) != 0u || (p2 & (VDSC0_ENABLE | VDSC1_ENABLE)) != 0u;
+	if (gateSet && pipeOff) intel_dsc_disable();
 }
 
-static constexpr uint32_t kVdscRegs = 24, kVdscDwords = 26, kVdscPpsRegs = 12, kVdscEngine1 = 0x100;
+static constexpr uint32_t kVdscRegs = 24, kVdscDwords = 26, kVdscPpsRegs = 12;
 static constexpr size_t kVdscParamsDsc = 0x88, kVdscPathPipe = 0x3640, kVdscPathPort = 0x3648;
 static constexpr size_t kVdscPortDsc = 0x11c;
+// Apple's 26 DSC dwords, in the order intel_dsc_pps_configure writes them: PPS 0-10 and 16, the four RC buffer thresholds, the eight RC
+// range parameter words, DSS_CTL1, DSS_CTL2.
 static const uint32_t kVdscReg[kVdscRegs] = {
-	0x78070, 0x78074, 0x78078, 0x7807c, 0x78080, 0x78084, 0x78088, 0x7808c, 0x78090, 0x78094, 0x78098, 0x780b0,
-	0x78054, 0x78058, 0x7805c, 0x78060, 0x78008, 0x7800c, 0x78010, 0x78014, 0x78018, 0x7801c, 0x78020, 0x78024,
+	ICL_DSC0_PPS(PIPE_A, 0), ICL_DSC0_PPS(PIPE_A, 1), ICL_DSC0_PPS(PIPE_A, 2), ICL_DSC0_PPS(PIPE_A, 3), ICL_DSC0_PPS(PIPE_A, 4),
+	ICL_DSC0_PPS(PIPE_A, 5), ICL_DSC0_PPS(PIPE_A, 6), ICL_DSC0_PPS(PIPE_A, 7), ICL_DSC0_PPS(PIPE_A, 8), ICL_DSC0_PPS(PIPE_A, 9),
+	ICL_DSC0_PPS(PIPE_A, 10), ICL_DSC0_PPS(PIPE_A, 16),
+	ICL_DSC0_RC_BUF_THRESH(PIPE_A, 0), ICL_DSC0_RC_BUF_THRESH(PIPE_A, 1), ICL_DSC0_RC_BUF_THRESH(PIPE_A, 2), ICL_DSC0_RC_BUF_THRESH(PIPE_A, 3),
+	ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 0), ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 1), ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 2),
+	ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 3), ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 4), ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 5),
+	ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 6), ICL_DSC0_RC_RANGE_PARAMETERS(PIPE_A, 7),
 };
 static volatile uint32_t gVdscRouted = 0, gVdscFlushed = 0;
 static volatile uint32_t gVdscLatchOn = 0;
@@ -1556,12 +1592,41 @@ static void vdscLatch(const void *params, const void *path) {
 }
 
 static void vdscClearDss() {
-	auto *cb = NGreen::callback;
-	cb->writeReg32(kDssCtl1A, 0u);
-	cb->writeReg32(kDssCtl2A, 0u);
-	cb->readReg32(kDssCtl1A);
+	intel_dsc_disable();
 	gVdscFlushed = 0;
 	gVdscFlushPath = nullptr;
+}
+
+static int intel_dsc_get_vdsc_per_pipe(uint32_t dss_ctl2) {
+	return (dss_ctl2 & VDSC1_ENABLE) != 0u ? 2 : 1;
+}
+
+static void intel_dsc_pps_write(uint32_t reg, uint32_t pps_val, int vdsc_per_pipe) {
+	for (int i = 0; i < vdsc_per_pipe; i++)
+		NGreen::callback->writeReg32(reg + static_cast<uint32_t>(i) * kVdscDsc1Offset, pps_val);
+}
+
+static void intel_dsc_pps_configure(const uint32_t *dw, int vdsc_per_pipe) {
+	// Apple hands RC rows of zero for some modes; they are then left to the hardware (i915 always computes and writes its own).
+	bool rcZero = true;
+	for (uint32_t i = kVdscPpsRegs; i < kVdscRegs; i++) rcZero = rcZero && dw[i] == 0u;
+	for (uint32_t i = 0; i < kVdscRegs; i++) {
+		if (i >= kVdscPpsRegs && rcZero) continue;
+		intel_dsc_pps_write(kVdscReg[i], dw[i], vdsc_per_pipe);
+	}
+}
+
+static void intel_dsc_enable(const uint32_t *dw) {
+	auto *cb = NGreen::callback;
+	const int vdsc_instances_per_pipe = intel_dsc_get_vdsc_per_pipe(dw[25]);
+	intel_dsc_pps_configure(dw, vdsc_instances_per_pipe);
+	cb->writeReg32(ICL_PIPE_DSS_CTL1(PIPE_A), dw[24]);
+	cb->writeReg32(ICL_PIPE_DSS_CTL2(PIPE_A), dw[25]);
+	static volatile uint32_t rows = 0;
+	if (__sync_add_and_fetch(&rows, 1u) <= 2u)
+		SYSLOG("ngreen", "VDSC pipe A enabled as intel_dsc_enable: %d engine(s), PPS0 0x%x, RC rows %s, DSS_CTL1 0x%x DSS_CTL2 0x%x",
+		       vdsc_instances_per_pipe, dw[0], dw[kVdscPpsRegs] == 0u && dw[kVdscPpsRegs + 1] == 0u ? "left to the hardware" : "written",
+		       cb->readReg32(ICL_PIPE_DSS_CTL1(PIPE_A)), cb->readReg32(ICL_PIPE_DSS_CTL2(PIPE_A)));
 }
 
 static void vdscEnable(void *path) {
@@ -1576,20 +1641,7 @@ static void vdscEnable(void *path) {
 		return;
 	}
 	if (!latchOn || !portOn || pipe != 0u) return;
-	bool rcZero = true;
-	for (uint32_t i = kVdscPpsRegs; i < kVdscRegs; i++) rcZero = rcZero && gVdscLatchDw[i] == 0u;
-	for (uint32_t i = 0; i < kVdscRegs; i++) {
-		if (i >= kVdscPpsRegs && rcZero) continue;
-		for (uint32_t e = 0; e < 2u; e++) {
-			const uint32_t reg = kVdscReg[i] + e * kVdscEngine1;
-			cb->writeReg32(reg, gVdscLatchDw[i]);
-			(void)cb->readReg32(reg);
-		}
-	}
-	cb->writeReg32(kDssCtl1A, gVdscLatchDw[24]);
-	cb->writeReg32(kDssCtl2A, gVdscLatchDw[25]);
-	(void)cb->readReg32(kDssCtl1A);
-	(void)cb->readReg32(kDssCtl2A);
+	intel_dsc_enable(gVdscLatchDw);
 	gVdscFlushPath = path;
 	gVdscFlushed = 1;
 }
