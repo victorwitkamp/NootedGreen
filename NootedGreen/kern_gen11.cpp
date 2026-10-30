@@ -104,43 +104,107 @@ static void roundScratchSize(void *params) {
 	}
 }
 
-static constexpr uint32_t kRenderWaMcrSelector   = 0xfdc;
-static constexpr uint32_t kRenderWaMcrMulticast  = 1u << 31;
-static constexpr uint32_t kRenderWaMcrSliceMask  = 0xfu << 27;
-static constexpr uint32_t kRenderWaMcrSubMask    = 0x7u << 24;
-static constexpr uint32_t kRenderWaDssEnable     = 0x913c;
-static constexpr uint32_t kRenderWaGarbcntl      = 0xb004;
-static constexpr uint32_t kRenderWaBusHashExc    = 1u << 7;
-static constexpr uint32_t kRenderWaRow2Bits      = GEN12_DISABLE_EARLY_READ | GEN12_PUSH_CONST_DEREF_HOLD_DIS;
+// From i915, drivers/gpu/drm/i915/gt/intel_workarounds.c: the render-engine rows of rcs_engine_wa_init that apply to ADL-S
+// (Wa_22010271021 FF_DOP_CLOCK_GATE_DISABLE, Wa_1606931601 GEN12_DISABLE_EARLY_READ, Wa_14010919138 GEN12_FF_TESSELATION_DOP_GATE_DISABLE,
+// Wa_1406941453 ENABLE_SMALLPL, Wa_1409804808 GEN12_PUSH_CONST_DEREF_HOLD_DIS, Wa_14010229206 GEN12_DISABLE_TDL_PUSH), the tuning row of
+// add_render_compute_tuning_settings (GEN12_BUS_HASH_CTL_BIT_EXC cleared in GEN8_GARBCNTL) and icl_wa_init_mcr's steering (reads steered
+// to the lowest subslice that is not fused off, __set_mcr_steering). i915 keeps them in a list its reset path applies; here they are
+// written by MMIO at the engine probe and before a stop, a masked row as REG_MASKED_FIELD_ENABLE. The GEN8_CS_CHICKEN1 preemption level
+// is a context workaround in i915 (gen12_ctx_workarounds_init: the context-image table above), so it is not written here any more; the
+// GEN11_INDIRECT_STATE_BASE_ADDR_OVERRIDE row of general_render_compute_wa_init is a contract with Mesa's sampler states and is not
+// applied under Apple's Metal driver. The multicast bit of GEN8_MCR_SELECTOR is forced on around the MCR rows: i915 owns the selector and
+// relies on its default, Apple's driver leaves it in either state. The registers: gt/intel_gt_regs.h.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_workarounds.c#L1271-L1332
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_workarounds.c#L2279-L2320
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_workarounds.c#L2724-L2743
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L72-L82
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L629
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L941-L943
+static constexpr uint32_t GEN11_MCR_MULTICAST     = 1u << 31;
+#define GEN11_MCR_SLICE(slice)		(((slice) & 0xf) << 27)
+#define GEN11_MCR_SLICE_MASK			GEN11_MCR_SLICE(0xf)
+#define GEN11_MCR_SUBSLICE(subslice)		(((subslice) & 0x7) << 24)
+#define GEN11_MCR_SUBSLICE_MASK		GEN11_MCR_SUBSLICE(0x7)
+static constexpr uint32_t GEN12_GT_GEOMETRY_DSS_ENABLE = 0x913cu;
+static constexpr uint32_t GEN8_GARBCNTL                = 0xb004u;
+static constexpr uint32_t GEN12_BUS_HASH_CTL_BIT_EXC   = 1u << 7;
+
+static void __set_mcr_steering(NGreen *cb, uint32_t steering_reg, uint32_t slice, uint32_t subslice) {
+	const uint32_t mcr = GEN11_MCR_SLICE(slice) | GEN11_MCR_SUBSLICE(subslice);
+	const uint32_t mcr_mask = GEN11_MCR_SLICE_MASK | GEN11_MCR_SUBSLICE_MASK;
+	cb->writeReg32(steering_reg, (cb->readReg32(steering_reg) & ~mcr_mask) | mcr);
+}
+
+static void icl_wa_init_mcr(NGreen *cb) {
+	/*
+	 * Although a platform may have subslices, we need to always steer
+	 * reads to the lowest instance that isn't fused off.  When Render
+	 * Power Gating is enabled, grabbing forcewake will only power up a
+	 * single subslice (the "minconfig") if there isn't a real workload
+	 * that needs to be run; this means that if we steer register reads to
+	 * one of the higher subslices, we run the risk of reading back 0's or
+	 * random garbage.
+	 */
+	const uint32_t dss = cb->readReg32(GEN12_GT_GEOMETRY_DSS_ENABLE);
+	const uint32_t subslice = (dss != 0 && dss != 0xffffffffu) ? static_cast<uint32_t>(__builtin_ctz(dss)) : 0u;
+	__set_mcr_steering(cb, GEN8_MCR_SELECTOR, 0, subslice);
+}
+
+static void add_render_compute_tuning_settings(NGreen *cb) {
+	const uint32_t garb = cb->readReg32(GEN8_GARBCNTL);
+	if (garb != 0 && garb != 0xffffffffu) cb->writeReg32(GEN8_GARBCNTL, garb & ~GEN12_BUS_HASH_CTL_BIT_EXC);
+}
+
+// The rows are written in two passes, the MCR rows under the multicast selector: mcr_rows picks the pass.
+static void rcs_engine_wa_init(NGreen *cb, bool mcr_rows) {
+	if (!mcr_rows) {
+		/*
+		 * Wa_1606700617:tgl,dg1,adl-p
+		 * Wa_22010271021:tgl,rkl,dg1,adl-s,adl-p
+		 * Wa_14010826681:tgl,dg1,rkl,adl-p
+		 * Wa_18019627453:dg2
+		 */
+		cb->writeReg32(GEN9_CS_DEBUG_MODE1, _MASKED_BIT_ENABLE(FF_DOP_CLOCK_GATE_DISABLE));
+		/*
+		 * Wa_1407928979:tgl A*
+		 * Wa_18011464164:tgl[B0+],dg1[B0+]
+		 * Wa_22010931296:tgl[B0+],dg1[B0+]
+		 * Wa_14010919138:rkl,dg1,adl-s,adl-p
+		 */
+		const uint32_t ffThr = cb->readReg32(GEN7_FF_THREAD_MODE);
+		if (ffThr != 0xffffffffu) cb->writeReg32(GEN7_FF_THREAD_MODE, ffThr | GEN12_FF_TESSELATION_DOP_GATE_DISABLE);
+		return;
+	}
+	/* Wa_1606931601:tgl,rkl,dg1,adl-s,adl-p and Wa_1409804808 */
+	cb->writeReg32(GEN8_ROW_CHICKEN2, _MASKED_BIT_ENABLE(GEN12_DISABLE_EARLY_READ | GEN12_PUSH_CONST_DEREF_HOLD_DIS));
+	/* Wa_14010229206 */
+	cb->writeReg32(GEN9_ROW_CHICKEN4, _MASKED_BIT_ENABLE(GEN12_DISABLE_TDL_PUSH));
+	/* Wa_1406941453:tgl,rkl,dg1,adl-s,adl-p */
+	cb->writeReg32(GEN10_SAMPLER_MODE, _MASKED_BIT_ENABLE(ENABLE_SMALLPL));
+}
 
 static void applyRenderWa(NGreen *cb, bool steer) {
 	if (cb == nullptr) return;
-	const uint32_t mcr = cb->readReg32(kRenderWaMcrSelector);
+	const uint32_t mcr = cb->readReg32(GEN8_MCR_SELECTOR);
 	const uint32_t ffThr = cb->readReg32(GEN7_FF_THREAD_MODE);
-	const uint32_t garb = cb->readReg32(kRenderWaGarbcntl);
-	uint32_t steerTo = 0;
-	if (steer) {
-		const uint32_t dss = cb->readReg32(kRenderWaDssEnable);
-		const uint32_t ss = (dss != 0 && dss != 0xffffffffu) ? (static_cast<uint32_t>(__builtin_ctz(dss)) & 7u) : 0u;
-		steerTo = ss << 24;
-	}
+	const uint32_t garb = cb->readReg32(GEN8_GARBCNTL);
 	const bool awake = ffThr != 0 && ffThr != 0xffffffffu && mcr != 0xffffffffu && garb != 0xffffffffu;
-	if (steer && awake) {
-		cb->writeReg32(kRenderWaMcrSelector, (mcr & ~(kRenderWaMcrSliceMask | kRenderWaMcrSubMask)) | steerTo);
-	}
-	cb->writeReg32(GEN9_CS_DEBUG_MODE1, (FF_DOP_CLOCK_GATE_DISABLE << 16) | FF_DOP_CLOCK_GATE_DISABLE);
-	cb->writeReg32(GEN8_CS_CHICKEN1, (GEN9_PREEMPT_GPGPU_LEVEL_MASK << 16) | GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL);
-	if (awake) cb->writeReg32(GEN7_FF_THREAD_MODE, ffThr | GEN12_FF_TESSELATION_DOP_GATE_DISABLE);
-	if (awake && garb != 0) cb->writeReg32(kRenderWaGarbcntl, garb & ~kRenderWaBusHashExc);
-	const uint32_t selNow = cb->readReg32(kRenderWaMcrSelector);
-	const bool mcOn = awake && selNow != 0xffffffffu && (selNow & kRenderWaMcrMulticast) != 0;
+	if (steer && awake) icl_wa_init_mcr(cb);
+	rcs_engine_wa_init(cb, false);
+	if (awake) add_render_compute_tuning_settings(cb);
+	const uint32_t selNow = cb->readReg32(GEN8_MCR_SELECTOR);
+	const bool mcOn = awake && selNow != 0xffffffffu && (selNow & GEN11_MCR_MULTICAST) != 0;
 	if (mcOn || (steer && awake && selNow != 0xffffffffu)) {
-		if (!mcOn) cb->writeReg32(kRenderWaMcrSelector, selNow | kRenderWaMcrMulticast);
-		cb->writeReg32(GEN8_ROW_CHICKEN2, (kRenderWaRow2Bits << 16) | kRenderWaRow2Bits);
-		cb->writeReg32(GEN9_ROW_CHICKEN4, (GEN12_DISABLE_TDL_PUSH << 16) | GEN12_DISABLE_TDL_PUSH);
-		cb->writeReg32(GEN10_SAMPLER_MODE, (ENABLE_SMALLPL << 16) | ENABLE_SMALLPL);
-		if (!mcOn) cb->writeReg32(kRenderWaMcrSelector, selNow);
+		if (!mcOn) cb->writeReg32(GEN8_MCR_SELECTOR, selNow | GEN11_MCR_MULTICAST);
+		rcs_engine_wa_init(cb, true);
+		if (!mcOn) cb->writeReg32(GEN8_MCR_SELECTOR, selNow);
 	}
+	static volatile uint32_t rows = 0;
+	if (__sync_add_and_fetch(&rows, 1u) <= 4u)
+		SYSLOG("ngreen", "render workarounds: awake %u steer %u selector 0x%x -> 0x%x (multicast %u); CS_DEBUG_MODE1 0x%x FF_THREAD_MODE 0x%x GARBCNTL 0x%x ROW_CHICKEN2 0x%x ROW_CHICKEN4 0x%x SAMPLER_MODE 0x%x",
+		       awake ? 1u : 0u, steer ? 1u : 0u, mcr, cb->readReg32(GEN8_MCR_SELECTOR), mcOn ? 1u : 0u, cb->readReg32(GEN9_CS_DEBUG_MODE1),
+		       cb->readReg32(GEN7_FF_THREAD_MODE), cb->readReg32(GEN8_GARBCNTL), cb->readReg32(GEN8_ROW_CHICKEN2), cb->readReg32(GEN9_ROW_CHICKEN4),
+		       cb->readReg32(GEN10_SAMPLER_MODE));
 }
 
 static constexpr uint64_t kScratchSizeApple = 0xd240;
