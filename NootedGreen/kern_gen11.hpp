@@ -639,6 +639,8 @@ static inline unsigned long find_next_bit(const unsigned long *addr, unsigned lo
 #define __bf_shf(x) (__builtin_ffsll(x) - 1)
 #define REG_FIELD_PREP(__mask, __val) \
 ((uint32_t)((__typeof(__mask))(__val) << __bf_shf(__mask)) & (__mask))
+// The kernel's FIELD_GET (include/linux/bitfield.h) for a constant mask: the field's value, shifted down.
+#define FIELD_GET(_mask, _reg)	(((_reg) & (_mask)) >> __bf_shf(_mask))
 
 // Apple's command streamer type enum (matches IGAccel internal enum)
 enum IGHwCsType

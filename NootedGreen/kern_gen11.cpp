@@ -1109,9 +1109,10 @@ static bool csbRawEntry(const uint8_t *cs, uint32_t &lo, uint32_t &hi, uint32_t 
 	} else {
 		const uint8_t *hwsp = *reinterpret_cast<const uint8_t *const *>(cs + kCsOffHwsp);
 		if (hwsp == nullptr) return false;
-		lo = *reinterpret_cast<const volatile uint32_t *>(hwsp + 0x40u + rd * 8u);
-		hi = *reinterpret_cast<const volatile uint32_t *>(hwsp + 0x40u + rd * 8u + 4u);
-		ptr = *reinterpret_cast<const volatile uint32_t *>(hwsp + 0xbcu);
+		// The CSB ring and its write pointer sit in the HWSP where i915 reads them (I915_HWS_CSB_BUF0_INDEX, ICL_HWS_CSB_WRITE_INDEX).
+		lo = *reinterpret_cast<const volatile uint32_t *>(hwsp + I915_HWS_CSB_BUF0_INDEX * 4u + rd * 8u);
+		hi = *reinterpret_cast<const volatile uint32_t *>(hwsp + I915_HWS_CSB_BUF0_INDEX * 4u + rd * 8u + 4u);
+		ptr = *reinterpret_cast<const volatile uint32_t *>(hwsp + ICL_HWS_CSB_WRITE_INDEX * 4u);
 	}
 	return true;
 }
@@ -11077,13 +11078,13 @@ void Gen11::wrapPreempted(void *that, const uint32_t *e) {
 		if (cur0 == 0 || pend0 == 0) {
 			uint32_t lo = 0, hi = 0, ptr = 0;
 			const bool ok = csbRawEntry(cs, lo, hi, ptr);
-			const bool newq = ok ? (lo & 1u) != 0 : (e[0] & 0x1f0u) != 0;
+			const bool newq = ok ? (lo & GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE) != 0 : (e[0] & 0x1f0u) != 0;
 			if (pend0 == 0 && newq) {
 				return;
 			}
 			if (cur0 == 0 && csbT1Room()) {
 				__sync_fetch_and_add(&gCsbT1Uses, 1u);
-				if (ok && pend0 != 0 && callback->oIdleToActive != 0 && csbContextId(pend0) == ((lo >> 15) & 0x7ffu))
+				if (ok && pend0 != 0 && callback->oIdleToActive != 0 && csbContextId(pend0) == FIELD_GET(GEN12_CSB_SW_CTX_ID_MASK, lo))
 					FunctionCast(wrapIdleToActive, callback->oIdleToActive)(that, e);
 				return;
 			}

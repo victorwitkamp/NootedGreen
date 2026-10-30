@@ -25,4 +25,13 @@
 #define GEN11_CSB_READ_PTR_MASK		(GEN11_CSB_PTR_MASK << 8)
 #define GEN11_CSB_WRITE_PTR_MASK	(GEN11_CSB_PTR_MASK << 0)
 
+// The CSB entries in the HWSP (gt/intel_engine.h) and the fields of a gen 12 entry's low dword (gt/intel_execlists_submission.c):
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_engine.h#L201-L203
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_execlists_submission.c#L160-L163
+#define I915_HWS_CSB_BUF0_INDEX		0x10
+#define ICL_HWS_CSB_WRITE_INDEX		0x2f
+#define GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE	(0x1) /* lower csb dword */
+#define GEN12_CSB_SW_CTX_ID_MASK		GENMASK(25, 15)
+#define GEN12_IDLE_CTX_ID		0x7FF
+
 #endif
