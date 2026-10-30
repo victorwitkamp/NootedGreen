@@ -4409,21 +4409,31 @@ IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 	return ret;
 }
 
-struct PhyDriveEntry { uint8_t swingSel, nScalar, cursorCoeff, postCursor2, postCursor1; };
-static const PhyDriveEntry kPhyAdlsEdpHbr2[10] = {
-	{0x9, 0x73, 0x3D, 0x00, 0x02},
-	{0x9, 0x7A, 0x3C, 0x00, 0x03},
-	{0x9, 0x7F, 0x3B, 0x00, 0x04},
-	{0x4, 0x6C, 0x33, 0x00, 0x0C},
-	{0x2, 0x73, 0x3A, 0x00, 0x05},
-	{0x2, 0x7C, 0x38, 0x00, 0x07},
-	{0x4, 0x5A, 0x36, 0x00, 0x09},
-	{0x4, 0x57, 0x3D, 0x00, 0x02},
-	{0x4, 0x65, 0x38, 0x00, 0x07},
-	{0x4, 0x6C, 0x3A, 0x00, 0x05},
+// From i915, drivers/gpu/drm/i915/display/intel_ddi_buf_trans.h (struct icl_ddi_buf_trans) and intel_ddi_buf_trans.c
+// (_adls_combo_phy_trans_edp_hbr2: the ADL-S combo PHY's eDP HBR2 low-vswing table, the one this panel's link uses):
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi_buf_trans.h#L27-L33
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi_buf_trans.c#L845-L857
+struct icl_ddi_buf_trans { uint8_t dw2_swing_sel, dw7_n_scalar, dw4_cursor_coeff, dw4_post_cursor_2, dw4_post_cursor_1; };
+static const icl_ddi_buf_trans _adls_combo_phy_trans_edp_hbr2[10] = {
+	                                /* NT mV Trans mV db    */
+	{0x9, 0x73, 0x3D, 0x00, 0x02},  /* 200   200      0.0   */
+	{0x9, 0x7A, 0x3C, 0x00, 0x03},  /* 200   250      1.9   */
+	{0x9, 0x7F, 0x3B, 0x00, 0x04},  /* 200   300      3.5   */
+	{0x4, 0x6C, 0x33, 0x00, 0x0C},  /* 200   350      4.9   */
+	{0x2, 0x73, 0x3A, 0x00, 0x05},  /* 250   250      0.0   */
+	{0x2, 0x7C, 0x38, 0x00, 0x07},  /* 250   300      1.6   */
+	{0x4, 0x5A, 0x36, 0x00, 0x09},  /* 250   350      2.9   */
+	{0x4, 0x57, 0x3D, 0x00, 0x02},  /* 300   300      0.0   */
+	{0x4, 0x65, 0x38, 0x00, 0x07},  /* 300   350      1.3   */
+	{0x4, 0x6C, 0x3A, 0x00, 0x05},  /* 350   350      0.0   */
 };
 
-static int driveLevelFor(uint32_t swing, uint32_t preEmph) {
+// From i915, drivers/gpu/drm/i915/display/intel_ddi.c, translate_signal_level: the row of index_to_dp_signal_levels that holds a
+// swing / pre-emphasis pair. The grid is that table inverted (row = swing, column = pre-emphasis); a pair outside it answers -1
+// where i915 warns and answers 0.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L95-L106
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L1470-L1491
+static int translate_signal_level(uint32_t swing, uint32_t preEmph) {
 	static const int8_t kGrid[4][4] = {
 		{ 0,  1,  2,  3},
 		{ 4,  5,  6, -1},
@@ -4438,21 +4448,21 @@ static void fixDriveEntry(uint32_t swing, uint32_t preEmph, uint32_t laneCount) 
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || !cb->mmioMapped()) return;
 
-	const int level = driveLevelFor(swing, preEmph);
+	const int level = translate_signal_level(swing, preEmph);
 	if (level < 0) return;
-	const PhyDriveEntry &e = kPhyAdlsEdpHbr2[level];
+	const icl_ddi_buf_trans &e = _adls_combo_phy_trans_edp_hbr2[level];
 
 	const uint32_t dw5 = cb->readReg32(kPhyTxDw5Ln0);
 	cb->writeReg32(kPhyTxDw5Grp, dw5 & ~kTxTrainingEn);
 
 	const uint32_t dw2cur = cb->readReg32(kPhyTxDw2Ln0);
-	const uint32_t dw2    = (dw2cur & kDw2ClearMask) | ((e.swingSel & 0x8u) << 12) |
-	                        ((e.swingSel & 0x7u) << 11) | 0x98u;
+	const uint32_t dw2    = (dw2cur & kDw2ClearMask) | ((e.dw2_swing_sel & 0x8u) << 12) |
+	                        ((e.dw2_swing_sel & 0x7u) << 11) | 0x98u;
 	cb->writeReg32(kPhyTxDw2Grp, dw2);
 
-	const uint32_t coeff = (static_cast<uint32_t>(e.postCursor1) << 12) |
-	                       (static_cast<uint32_t>(e.postCursor2) << 6) |
-	                       static_cast<uint32_t>(e.cursorCoeff);
+	const uint32_t coeff = (static_cast<uint32_t>(e.dw4_post_cursor_1) << 12) |
+	                       (static_cast<uint32_t>(e.dw4_post_cursor_2) << 6) |
+	                       static_cast<uint32_t>(e.dw4_cursor_coeff);
 	uint32_t txDw4Upper = 0;
 	bool     txDw4Have  = false;
 	if (gTxDw4UpperValid) {
@@ -4484,7 +4494,7 @@ static void fixDriveEntry(uint32_t swing, uint32_t preEmph, uint32_t laneCount) 
 	for (uint32_t ln = 0; ln < 4; ln++) {
 		const uint32_t reg = kPhyTxDw7Ln0 + ln * kPhyLaneStride;
 		const uint32_t cur = cb->readReg32(reg);
-		const uint32_t want = (cur & ~kNScalarMask) | (static_cast<uint32_t>(e.nScalar) << 24);
+		const uint32_t want = (cur & ~kNScalarMask) | (static_cast<uint32_t>(e.dw7_n_scalar) << 24);
 		if (want != cur) cb->writeReg32(reg, want);
 	}
 
