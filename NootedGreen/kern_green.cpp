@@ -212,8 +212,8 @@ void NGreen::init() {
 	mmioLock = IOSimpleLockAlloc();
 
 	lilu.onKextLoadForce(&kextAGDP);
-	/*lilu.onKextLoadForce(&kextBacklight);
-	lilu.onKextLoadForce(&kextMCCSControl);*/
+	lilu.onKextLoadForce(&kextBacklight);
+	/*lilu.onKextLoadForce(&kextMCCSControl);*/
 	lilu.onKextLoadForce(&kextIOGraphics);
 	lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
 	lilu.onKextLoadForce(&kextAppleGraphicsDeviceControl);
@@ -630,8 +630,8 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply AGDP fb count check patch");
 		}*/
 	}  else if (kextBacklight.loadIndex == index) {
-		// V204b: re-enable AppleIntelPanel::setDisplay route + backlight string patch.
-		// Friend's working version has these enabled. Sets up panel data for backlight ramp.
+		// AppleIntelPanel::setDisplay has no table for a panel Apple does not list: its "Default" entry fails the call
+		// and the display gets no brightness parameter. Add WhateverGreen's tables, looked up as F<_UID>Txxxx.
 		KernelPatcher::RouteRequest request {"__ZN15AppleIntelPanel10setDisplayEP9IODisplay", wrapApplePanelSetDisplay,
 			orgApplePanelSetDisplay};
 		if (patcher.routeMultiple(kextBacklight.loadIndex, &request, 1, address, size)) {
@@ -804,6 +804,15 @@ bool NGreen::wrapApplePanelSetDisplay(IOService *that, IODisplay *display) {
 	}
 
 	bool ret = FunctionCast(wrapApplePanelSetDisplay, callback->orgApplePanelSetDisplay)(that, display);
+	static int rows = 0;
+	if (rows++ < 4) {
+		auto *panel = OSDynamicCast(OSDictionary, that->getProperty("ApplePanel"));
+		auto *iter = panel ? OSCollectionIterator::withCollection(panel) : nullptr;
+		auto *key = iter ? OSDynamicCast(OSSymbol, iter->getNextObject()) : nullptr;
+		SYSLOG("ngreen", "AppleIntelPanel::setDisplay: %s, panel table %s", ret ? "true" : "false",
+			key ? key->getCStringNoCopy() : "none");
+		OSSafeReleaseNULL(iter);
+	}
 	return ret;
 }
 
