@@ -566,6 +566,8 @@ constexpr uint32_t GEN6_RP_STATE_CAP = MCHBAR_MIRROR_BASE_SNB + 0x5998;
 
 constexpr uint32_t GEN9_FREQUENCY_SHIFT = 23;
 constexpr uint32_t GEN9_FREQ_SCALER  = 3;
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L777
+#define   GEN9_FREQUENCY(x)			((x) << GEN9_FREQUENCY_SHIFT)
 
 // ─── Forcewake ──────────────────────────────────────────────────────────────
 // Forcewake keeps GT power domains awake for MMIO access.

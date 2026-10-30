@@ -599,12 +599,16 @@ static constexpr mach_vm_address_t kPmNotifyWrapperOff = 0x648fc;
 static const uint8_t kGtClockPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x49, 0x89, 0xc8, 0x48, 0x89, 0xd1, 0x89, 0xf2, 0x89, 0xfe};
 static volatile uint32_t gGtClockActive = 0;
 static volatile uint32_t gRp0Ratio = 0;
+// From i915, drivers/gpu/drm/i915/gt/intel_rps.c, __gen6_rps_get_freq_caps: rp0_freq is the low byte of GEN6_RP_STATE_CAP, times
+// GEN9_FREQ_SCALER on gen 11+ (the ratio in 16.67 MHz units); gen6_rps_set requests a frequency as GEN9_FREQUENCY(freq).
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_rps.c#L1136-L1170
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_rps.c#L803-L825
 static uint32_t rp0Ratio() {
 	uint32_t r = gRp0Ratio;
 	if (r != 0) return r;
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || !cb->mmioMapped()) return 0;
-	r = (cb->readReg32(0x145998u) & 0xffu) * 3u;
+	r = (cb->readReg32(GEN6_RP_STATE_CAP) & 0xffu) * GEN9_FREQ_SCALER;
 	if (r == 0 || r > 0x1ffu) return 0;
 	gRp0Ratio = r;
 	return r;
@@ -617,7 +621,7 @@ static int answerPmNotify(unsigned int cls, unsigned int busy, unsigned long lon
 	if (gGtClockActive == 0 || freq == nullptr) return static_cast<int>(kIOReturnUnsupported);
 	const uint32_t r = rp0Ratio();
 	if (r == 0) return static_cast<int>(kIOReturnUnsupported);
-	*freq = r << 23;
+	*freq = GEN9_FREQUENCY(r);
 	return 0;
 }
 static void routeGtClock(KernelPatcher &patcher, mach_vm_address_t address, size_t size);
