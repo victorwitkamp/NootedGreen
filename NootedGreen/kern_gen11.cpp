@@ -1568,8 +1568,6 @@ static void armAgdcNub(void *controller, mach_vm_address_t org) {
 }
 
 static constexpr uint32_t kSinkD3HoldMs = 20;
-static constexpr uint32_t kPpsCycleMs  = 500u;
-static constexpr uint32_t kPpsSettleMs = 50u;
 static constexpr uint8_t kSourceOUI[3] = {0x00, 0xAA, 0x01};
 
 static bool ensureA788DisplayAWells(bool requireDDI = true);
@@ -4284,27 +4282,48 @@ static volatile uint32_t gSinkPowerDone = 0;
 static constexpr mach_vm_address_t kWriteAUXOffset = 0x290BEu;
 using AUXFn = IOReturn (*)(void *, uint32_t, void *, uint32_t);
 
-static constexpr uint32_t kPpsPpStatus    = 0xC7200u;
-static constexpr uint32_t kPpsPpControl   = 0xC7204u;
-static constexpr uint32_t kPpsCtlOnBits   = 0x0Fu;
-static constexpr uint32_t kPpsCtlPpsOn    = 0x03u;
-static constexpr uint32_t kPpsStPpOn      = 0x80000000u;
-static constexpr uint32_t kPpsStSeqMask   = 0x30000000u;
-static constexpr uint32_t kPpsStCycleAct  = 0x08000000u;
-static constexpr uint32_t kPpsStStateMask = 0x0000000Fu;
-static constexpr uint32_t kPpsIdleOffMask = kPpsStPpOn | kPpsStSeqMask;
-static constexpr uint32_t kPpsIdleCycMask = kPpsStPpOn | kPpsStSeqMask | kPpsStCycleAct | kPpsStStateMask;
-static constexpr uint32_t kPpsIdleOnMask  = kPpsStPpOn | kPpsStSeqMask | kPpsStStateMask;
-static constexpr uint32_t kPpsIdleOnValue = kPpsStPpOn | 0x8u;
-static constexpr uint32_t kPpsPollStepMs  = 10u;
-static constexpr uint32_t kPpsPollMaxMs   = 5000u;
-static constexpr uint32_t kPpsAuxTries    = 10u;
+// From i915, drivers/gpu/drm/i915/display/intel_pps_regs.h and intel_pps.c: the panel power sequencer at the PCH's PPS base (this
+// platform's mmio_base is PCH_PPS_BASE, 0xC7200), the fields of PP_STATUS and PP_CONTROL, wait_panel_status's masks and its 10 ms / 5 s
+// poll, and the cycle delay intel_pps_readout_hw_state takes from BXT_POWER_CYCLE_DELAY_MASK ("<delay>+1 in 100ms units"; pps_init_delays
+// uses the larger of the hardware's and the VBT's, which this driver does not read, and the eDP spec's T11+T12 when both are 0).
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps_regs.h#L14-L55
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps.c#L594-L643
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps.c#L1368-L1400
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps.c#L1497-L1575
+static constexpr uint32_t PCH_PPS_BASE = 0xC7200u;
+static constexpr uint32_t PP_STATUS    = PCH_PPS_BASE + 0x0u;
+static constexpr uint32_t PP_CONTROL   = PCH_PPS_BASE + 0x4u;
+static constexpr uint32_t PP_ON                      = 1u << 31;
+static constexpr uint32_t PP_SEQUENCE_MASK           = 3u << 28;
+static constexpr uint32_t PP_SEQUENCE_NONE           = 0u << 28;
+static constexpr uint32_t PP_CYCLE_DELAY_ACTIVE      = 1u << 27;
+static constexpr uint32_t PP_SEQUENCE_STATE_MASK     = 0xFu;
+static constexpr uint32_t PP_SEQUENCE_STATE_OFF_IDLE = 0x0u;
+static constexpr uint32_t PP_SEQUENCE_STATE_ON_IDLE  = 0x8u;
+static constexpr uint32_t BXT_POWER_CYCLE_DELAY_MASK = 0x1Fu << 4;
+static constexpr uint32_t EDP_FORCE_VDD     = 1u << 3;
+static constexpr uint32_t EDP_BLC_ENABLE    = 1u << 2;
+static constexpr uint32_t PANEL_POWER_RESET = 1u << 1;
+static constexpr uint32_t PANEL_POWER_ON    = 1u << 0;
+static constexpr uint32_t IDLE_ON_MASK     = PP_ON | PP_SEQUENCE_MASK | 0                     | PP_SEQUENCE_STATE_MASK;
+static constexpr uint32_t IDLE_ON_VALUE    = PP_ON | PP_SEQUENCE_NONE | 0                     | PP_SEQUENCE_STATE_ON_IDLE;
+static constexpr uint32_t IDLE_OFF_MASK    = PP_ON | PP_SEQUENCE_MASK | 0                     | 0;
+static constexpr uint32_t IDLE_OFF_VALUE   = 0     | PP_SEQUENCE_NONE | 0                     | 0;
+static constexpr uint32_t IDLE_CYCLE_MASK  = PP_ON | PP_SEQUENCE_MASK | PP_CYCLE_DELAY_ACTIVE | PP_SEQUENCE_STATE_MASK;
+static constexpr uint32_t IDLE_CYCLE_VALUE = 0     | PP_SEQUENCE_NONE | 0                     | PP_SEQUENCE_STATE_OFF_IDLE;
+static constexpr uint32_t kPpsAuxTries     = 10u;  // drm_dp_dpcd_access retries a transfer that fails right after the panel comes up
 
-static void ppsWaitStatus(uint32_t mask, uint32_t value) {
+static void wait_panel_status(uint32_t mask, uint32_t value) {
 	auto *cb = NGreen::callback;
-	for (uint32_t elapsed = 0; (cb->readReg32(kPpsPpStatus) & mask) != value && elapsed < kPpsPollMaxMs;
-	     elapsed += kPpsPollStepMs)
-		IOSleep(kPpsPollStepMs);
+	for (uint32_t elapsed = 0; (cb->readReg32(PP_STATUS) & mask) != value && elapsed < 5000u; elapsed += 10u)
+		IOSleep(10);
+}
+
+// pps_init_delays: the hardware's cycle delay, or the eDP spec's 510 ms (T11+T12) when the register holds none.
+static uint32_t panel_power_cycle_delay(uint32_t pp_ctl) {
+	const uint32_t power_cycle_delay = (pp_ctl & BXT_POWER_CYCLE_DELAY_MASK) >> 4;
+	const uint32_t hw = power_cycle_delay != 0 ? (power_cycle_delay - 1u) * 100u : 0u;
+	return hw != 0 ? hw : 510u;
 }
 
 static constexpr uint32_t kPpsSinkAddrs[] = {
@@ -4386,25 +4405,45 @@ IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 		readAUX(that, 0x0600, &value, 1);
 		auto *cb = NGreen::callback;
 		if (cb != nullptr && cb->mmioMapped()) {
-			const uint32_t status = cb->readReg32(kPpsPpStatus);
-			const uint32_t control = cb->readReg32(kPpsPpControl);
-			if ((status & kPpsStPpOn) != 0u && (control & 1u) != 0u) {
-				const uint32_t off = control & ~kPpsCtlOnBits;
-				cb->writeReg32(kPpsPpControl, off);
-				(void)cb->readReg32(kPpsPpControl);
-				ppsWaitStatus(kPpsIdleOffMask, 0u);
-				IOSleep(kPpsCycleMs);
-				ppsWaitStatus(kPpsIdleCycMask, 0u);
-				cb->writeReg32(kPpsPpControl, off | kPpsCtlPpsOn);
-				(void)cb->readReg32(kPpsPpControl);
-				ppsWaitStatus(kPpsIdleOnMask, kPpsIdleOnValue);
-				cb->writeReg32(kPpsPpControl, control);
-				(void)cb->readReg32(kPpsPpControl);
-				IOSleep(kPpsSettleMs);
-				for (uint32_t i = 0; i < kPpsAuxTries; i++) {
+			// From i915, drivers/gpu/drm/i915/display/intel_pps.c: one panel power cycle as intel_pps_off_unlocked and
+			// intel_pps_on_unlocked run it (the sink put in D3 first, as intel_ddi_post_disable orders them): PANEL_POWER_ON,
+			// PANEL_POWER_RESET, EDP_FORCE_VDD and EDP_BLC_ENABLE cleared together ("otherwise some panels get very unhappy"), wait_panel_off;
+			// wait_panel_power_cycle (the remainder of panel_power_cycle_delay since the off, then the sequencer's own cycle flag);
+			// PANEL_POWER_ON | PANEL_POWER_RESET set, wait_panel_on. VDD and the backlight are not restored here: i915 sets them again
+			// through intel_pps_vdd_on and intel_pps_backlight_on when they are wanted, and Apple's own PP_CONTROL writes do the same later
+			// (at link training the register reads PANEL_POWER_ON | PANEL_POWER_RESET on every boot on record).
+			// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps.c#L1026-L1069
+			// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps.c#L669-L694
+			// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_pps.c#L954-L1015
+			const uint32_t status = cb->readReg32(PP_STATUS);
+			uint32_t pp = cb->readReg32(PP_CONTROL);
+			if ((status & PP_ON) != 0u && (pp & PANEL_POWER_ON) != 0u) {
+				const uint32_t pp_entry = pp;
+				const uint32_t t_off = uptimeMs();
+				pp &= ~(PANEL_POWER_ON | PANEL_POWER_RESET | EDP_FORCE_VDD | EDP_BLC_ENABLE);
+				cb->writeReg32(PP_CONTROL, pp);
+				(void)cb->readReg32(PP_CONTROL);
+				wait_panel_status(IDLE_OFF_MASK, IDLE_OFF_VALUE);
+				const uint32_t panel_power_off_time = uptimeMs();
+				const uint32_t cycle = panel_power_cycle_delay(pp_entry);
+				const uint32_t panel_power_off_duration = uptimeMs() - panel_power_off_time;
+				const uint32_t remaining = cycle > panel_power_off_duration ? cycle - panel_power_off_duration : 0u;
+				if (remaining != 0) IOSleep(remaining);
+				wait_panel_status(IDLE_CYCLE_MASK, IDLE_CYCLE_VALUE);
+				const uint32_t t_on = uptimeMs();
+				pp |= PANEL_POWER_ON | PANEL_POWER_RESET;
+				cb->writeReg32(PP_CONTROL, pp);
+				(void)cb->readReg32(PP_CONTROL);
+				wait_panel_status(IDLE_ON_MASK, IDLE_ON_VALUE);
+				const uint32_t t_ready = uptimeMs();
+				uint32_t tries = 0;
+				for (; tries < kPpsAuxTries; tries++) {
 					if (readAUX(that, 0x0600, &value, 1) == kIOReturnSuccess) break;
 					IOSleep(10);
 				}
+				SYSLOG("ngreen", "panel power cycle: T12 %u ms from PP_CONTROL 0x%x, off %u ms, on %u ms, now PP_CONTROL 0x%x PP_STATUS 0x%x, aux ready at try %u",
+				       cycle, pp_entry, panel_power_off_time - t_off, t_ready - t_on, cb->readReg32(PP_CONTROL), cb->readReg32(PP_STATUS),
+				       tries < kPpsAuxTries ? tries + 1u : 0u);
 				if (that != nullptr)
 					for (uint32_t addr : kPpsSinkAddrs) readAUX(that, addr, &value, 1);
 			}
