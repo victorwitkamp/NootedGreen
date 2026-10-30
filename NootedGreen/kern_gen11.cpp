@@ -5047,6 +5047,9 @@ IOReturn Gen11::wrapSetAttribute(void *that, uint32_t attr, uintptr_t value) {
 	return FunctionCast(wrapSetAttribute, callback->oSetAttribute)(that, attr, value);
 }
 
+// The hwInitializeCState paths of the other DMC choices (ngreen-dmc=tgl, the ADL-P default) request their wells through the BIOS and
+// DRIVER registers at once and poll 2 ms; i915 never writes a BIOS request register. Neither path is Raptor Lake-HX's (#223 ran
+// neither), so they keep this routine.
 static bool pwrWellRequestAndWait(uint32_t reg, uint32_t requestMask) {
 	requestMask &= 0xAAAAAAAAu;
 	const uint32_t requested = NGreen::callback->readReg32(reg) | requestMask;
@@ -5061,49 +5064,110 @@ static bool pwrWellRequestAndWait(uint32_t reg, uint32_t requestMask) {
 	return false;
 }
 
-static void applyA788DriverRequests(uint32_t reg, uint32_t requestMask) {
-	constexpr uint32_t allRequestBits = 0xAAAAAAAAu;
-	const uint32_t requested = requestMask & allRequestBits;
-	const uint32_t current = NGreen::callback->readReg32(reg);
-	const uint32_t removedRequests = (current & allRequestBits) & ~requested;
-	const uint32_t updated = (current & ~allRequestBits) | requested;
-	NGreen::callback->writeReg32(reg, updated);
+// From i915, drivers/gpu/drm/i915/display/intel_display_power_well.c: the ICL register sets of the AUX and DDI wells (BIOS, DRIVER and
+// DEBUG request registers), hsw_power_well_enable with hsw_wait_for_power_well_enable (the REQ bit set in the driver register, the
+// STATE bit awaited for 1 ms), hsw_power_well_disable with hsw_wait_for_power_well_disable (the REQ bit cleared, the STATE bit awaited
+// clear for 1 ms, or not at all when another requester still holds the well: hsw_power_well_requesters) and hsw_power_well_enabled.
+// ADL-S's AUX A takes icl_aux_power_well_enable's hsw_power_well_enable branch. The registers: display/intel_display_regs.h.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_power_well.c#L343-L421
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_power_well.c#L432-L485
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_power_well.c#L635-L645
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_power_well.c#L2101-L2119
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2374-L2379
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2410-L2454
+struct i915_power_well_regs { uint32_t bios, driver, debug; };
+static constexpr uint32_t ICL_PWR_WELL_CTL_AUX1 = 0x45440u;
+static constexpr uint32_t ICL_PWR_WELL_CTL_AUX2 = 0x45444u;
+static constexpr uint32_t ICL_PWR_WELL_CTL_AUX4 = 0x4544Cu;
+static constexpr uint32_t ICL_PWR_WELL_CTL_DDI1 = 0x45450u;
+static constexpr uint32_t ICL_PWR_WELL_CTL_DDI2 = 0x45454u;
+static constexpr uint32_t ICL_PWR_WELL_CTL_DDI4 = 0x4545Cu;
+static constexpr int ICL_PW_CTL_IDX_AUX_A = 0;
+static constexpr int ICL_PW_CTL_IDX_DDI_A = 0;
+#define HSW_PWR_WELL_CTL_REQ(pw_idx)		(0x2 << ((pw_idx) * 2))
+#define HSW_PWR_WELL_CTL_STATE(pw_idx)	(0x1 << ((pw_idx) * 2))
+static constexpr i915_power_well_regs icl_aux_power_well_regs = { ICL_PWR_WELL_CTL_AUX1, ICL_PWR_WELL_CTL_AUX2, ICL_PWR_WELL_CTL_AUX4 };
+static constexpr i915_power_well_regs icl_ddi_power_well_regs = { ICL_PWR_WELL_CTL_DDI1, ICL_PWR_WELL_CTL_DDI2, ICL_PWR_WELL_CTL_DDI4 };
 
-	const uint32_t requestedStateMask = requested >> 1;
-	uint32_t clearStateMask = removedRequests >> 1;
-	uint32_t externalRequests = 0;
-	uint32_t now = updated;
-	for (int attempt = 0; attempt < 200; attempt++) {
-		if (removedRequests != 0) {
-			externalRequests = (NGreen::callback->readReg32(reg - 4u) |
-				NGreen::callback->readReg32(reg + 8u)) & removedRequests;
-			clearStateMask = (removedRequests & ~externalRequests) >> 1;
+static bool hsw_wait_for_power_well_enable(const i915_power_well_regs &regs, int pw_idx) {
+	/* Timeout for PW1:10 us, AUX:not specified, other PWs:20 us. */
+	return intel_de_wait_ms(regs.driver, HSW_PWR_WELL_CTL_STATE(pw_idx), true, 1);
+}
+
+static uint32_t hsw_power_well_requesters(const i915_power_well_regs &regs, int pw_idx) {
+	auto *cb = NGreen::callback;
+	const uint32_t req_mask = HSW_PWR_WELL_CTL_REQ(pw_idx);
+	uint32_t ret;
+
+	ret = (cb->readReg32(regs.bios) & req_mask) ? 1 : 0;
+	ret |= (cb->readReg32(regs.driver) & req_mask) ? 2 : 0;
+	ret |= (cb->readReg32(regs.debug) & req_mask) ? 8 : 0;
+
+	return ret;
+}
+
+static bool hsw_wait_for_power_well_disable(const i915_power_well_regs &regs, int pw_idx) {
+	/*
+	 * Bspec doesn't require waiting for PWs to get disabled, but still do
+	 * this for paranoia. The known cases where a PW will be forced on:
+	 * - a KVMR request on any power well via the KVMR request register
+	 * - a DMC request on PW1 and MISC_IO power wells via the BIOS and
+	 *   DEBUG request registers
+	 * Skip the wait in case any of the request bits are set and print a
+	 * diagnostic message.
+	 */
+	const uint32_t reqs = hsw_power_well_requesters(regs, pw_idx);
+	return intel_de_wait_ms(regs.driver, HSW_PWR_WELL_CTL_STATE(pw_idx), false, reqs ? 0 : 1);
+}
+
+static bool hsw_power_well_enable(const i915_power_well_regs &regs, int pw_idx) {
+	NGreen::callback->intel_de_rmw(regs.driver, 0, HSW_PWR_WELL_CTL_REQ(pw_idx));
+	return hsw_wait_for_power_well_enable(regs, pw_idx);
+}
+
+static bool hsw_power_well_disable(const i915_power_well_regs &regs, int pw_idx) {
+	NGreen::callback->intel_de_rmw(regs.driver, HSW_PWR_WELL_CTL_REQ(pw_idx), 0);
+	return hsw_wait_for_power_well_disable(regs, pw_idx);
+}
+
+static bool hsw_power_well_enabled(const i915_power_well_regs &regs, int pw_idx) {
+	const uint32_t mask = HSW_PWR_WELL_CTL_REQ(pw_idx) | HSW_PWR_WELL_CTL_STATE(pw_idx);
+	return (NGreen::callback->readReg32(regs.driver) & mask) == mask;
+}
+
+// Apple's hwSetPowerWellStateAux / DDI hand the whole request mask of a register: every well whose request changes is enabled or
+// disabled on its own, as intel_display_power_get / put would do it, in index order.
+static void icl_power_wells_request(const i915_power_well_regs &regs, uint32_t request_mask, const char *name) {
+	auto *cb = NGreen::callback;
+	const uint32_t current = cb->readReg32(regs.driver);
+	uint32_t enabled = 0, disabled = 0, timeouts = 0;
+	for (int pw_idx = 0; pw_idx < 16; pw_idx++) {
+		const uint32_t req = HSW_PWR_WELL_CTL_REQ(pw_idx);
+		if ((request_mask & req) != 0 && (current & req) == 0) {
+			enabled++;
+			if (!hsw_power_well_enable(regs, pw_idx)) timeouts++;
+		} else if ((request_mask & req) == 0 && (current & req) != 0) {
+			disabled++;
+			if (!hsw_power_well_disable(regs, pw_idx)) timeouts++;
 		}
-		now = NGreen::callback->readReg32(reg);
-		if ((now & requestedStateMask) == requestedStateMask && (now & clearStateMask) == 0)
-			return;
-		IODelay(10);
 	}
+	static volatile uint32_t rows = 0;
+	if (__sync_add_and_fetch(&rows, 1u) <= 8u)
+		SYSLOG("ngreen", "power wells %s: request 0x%x over driver 0x%x: %u enabled, %u disabled, %u timeouts; now driver 0x%x bios 0x%x debug 0x%x",
+		       name, request_mask, current, enabled, disabled, timeouts, cb->readReg32(regs.driver), cb->readReg32(regs.bios), cb->readReg32(regs.debug));
 }
 
 static bool ensureA788DisplayAWells(bool requireDDI) {
 	if (!NGreen::callback || !NGreen::callback->isRaptorLakeHX())
 		return true;
 
-	constexpr uint32_t auxDriver = 0x45444;
-	constexpr uint32_t ddiDriver = 0x45454;
-	constexpr uint32_t portARequest = 0x2;
-	constexpr uint32_t portAReady = 0x3;
-	uint32_t auxA = NGreen::callback->readReg32(auxDriver);
-	uint32_t ddiA = NGreen::callback->readReg32(ddiDriver);
-	if ((auxA & 0x3u) != 0x3u)
-		pwrWellRequestAndWait(auxDriver, portARequest);
-	if (requireDDI && (ddiA & 0x3u) != 0x3u)
-		pwrWellRequestAndWait(ddiDriver, portARequest);
+	if (!hsw_power_well_enabled(icl_aux_power_well_regs, ICL_PW_CTL_IDX_AUX_A))
+		hsw_power_well_enable(icl_aux_power_well_regs, ICL_PW_CTL_IDX_AUX_A);
+	if (requireDDI && !hsw_power_well_enabled(icl_ddi_power_well_regs, ICL_PW_CTL_IDX_DDI_A))
+		hsw_power_well_enable(icl_ddi_power_well_regs, ICL_PW_CTL_IDX_DDI_A);
 
-	auxA = NGreen::callback->readReg32(auxDriver);
-	ddiA = NGreen::callback->readReg32(ddiDriver);
-	return (auxA & portAReady) == portAReady && (!requireDDI || (ddiA & portAReady) == portAReady);
+	return hsw_power_well_enabled(icl_aux_power_well_regs, ICL_PW_CTL_IDX_AUX_A) &&
+	       (!requireDDI || hsw_power_well_enabled(icl_ddi_power_well_regs, ICL_PW_CTL_IDX_DDI_A));
 }
 
 // V183: ADL-P/RPL write-only power well handler.
@@ -5141,7 +5205,7 @@ void Gen11::hwSetPowerWellStatePGE(AppleIntel::AppleIntelBaseController *that, b
 void Gen11::hwSetPowerWellStateAux(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2)
 {
 	if (NGreen::callback && NGreen::callback->isRaptorLakeHX()) {
-		applyA788DriverRequests(0x45444, param_2);
+		icl_power_wells_request(icl_aux_power_well_regs, param_2, "AUX");
 		return;
 	}
 	getMember<void *>(that, 0x78) = ccont;
@@ -5151,7 +5215,7 @@ void Gen11::hwSetPowerWellStateAux(AppleIntel::AppleIntelBaseController *that, b
 void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2)
 {
 	if (NGreen::callback && NGreen::callback->isRaptorLakeHX()) {
-		applyA788DriverRequests(0x45454, param_2);
+		icl_power_wells_request(icl_ddi_power_well_regs, param_2, "DDI");
 		return;
 	}
 	getMember<void *>(that, 0x78) = ccont;
