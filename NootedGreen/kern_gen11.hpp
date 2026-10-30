@@ -561,6 +561,13 @@ __typeof(divisor) __d = divisor;			\
 #define GEN8_DE_PIPE_IMR_C  (0x44424)
 #define GEN8_DE_PIPE_IIR_C  (0x44428)
 #define GEN8_DE_PIPE_IER_C  (0x4442c)
+
+// The gen 6+ fence registers (i915_reg.h) and pipe A's source size (display/intel_display_regs.h):
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/i915_reg.h#L213-L215
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L533-L538
+#define FENCE_REG_GEN6_LO(i)		(0x100000 + (i) * 8)
+#define FENCE_REG_GEN6_HI(i)		(0x100000 + (i) * 8 + 4)
+#define _PIPEASRC		0x6001c
 // A plane's surface base register (display/skl_universal_plane_regs.h) and the plane numbers (display/intel_display_limits.h):
 // https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_reg_defs.h#L51-L52
 // https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/skl_universal_plane_regs.h#L11-L16

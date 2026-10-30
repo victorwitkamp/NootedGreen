@@ -5273,7 +5273,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 					   R(0x70194), R(0x70198), R(0x701A0), R(0x701CC));
 				// Pipe A general
 				SYSLOG("ngreen", "V203 PIPE_A: SRCSZ=%08x CONF=%08x MISC=%08x MISC2=%08x STAT=%08x",
-					   R(0x6001C), R(0x70008), R(0x70030), R(0x7002C), R(0x70024));
+					   R(_PIPEASRC), R(0x70008), R(0x70030), R(0x7002C), R(0x70024));
 				// Transcoder A timings
 				SYSLOG("ngreen", "V203 TRANS_A: HTOTAL=%08x HBLANK=%08x HSYNC=%08x VTOTAL=%08x VBLANK=%08x VSYNC=%08x VSYNCSHIFT=%08x",
 					   R(0x60000), R(0x60004), R(0x60008), R(0x6000C),
@@ -6330,16 +6330,19 @@ static void bootFillZero(uint32_t surf, uint64_t len) {
 	sub->release();
 }
 
+// The fence of the boot surface is read where i915's i965_write_fence_reg writes it (FENCE_REG_GEN6_LO / HI: the base and the
+// valid bit low, the pitch in 128-byte units minus one high); the height is pipe A's source size, as PIPESRC_HEIGHT_MASK holds it.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_ggtt_fencing.c#L62-L110
 static void bootFillAfterSetup(void *fb, bool isAperture, bool required, int ret) {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || fb == nullptr || !isAperture || !required || ret != 0) return;
 	const uint32_t surf = getMember<uint32_t>(fb, 0x4330), stride = getMember<uint32_t>(fb, 0x4334);
 	const uint32_t idx = getMember<uint8_t>(fb, 0x4288);
 	if (idx > 31u) return;
-	const uint32_t lo = cb->readReg32(0x100000u + idx * 8u), hi = cb->readReg32(0x100004u + idx * 8u);
+	const uint32_t lo = cb->readReg32(FENCE_REG_GEN6_LO(idx)), hi = cb->readReg32(FENCE_REG_GEN6_HI(idx));
 	const bool fenced = (lo & 1u) != 0 && (lo & 0xfffff000u) == (surf & 0xfffff000u) && stride >= 512u
 	                    && (hi & 0x7ffu) == (stride >> 7) - 1u;
-	const uint32_t h = (cb->readReg32(0x6001C) & 0x1fffu) + 1u;
+	const uint32_t h = (cb->readReg32(_PIPEASRC) & 0x1fffu) + 1u;
 	const uint64_t len = static_cast<uint64_t>(stride) * h;
 	cb->setApertureIfNecessary();
 	const bool sane = fenced && h >= 480u && h <= 4320u && stride <= 65536u && len <= (64ull << 20)
@@ -10296,7 +10299,7 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	if (v60Count == 3 || v60Count == 30) {
 		// Pipe A config
 		uint32_t pipeConf  = NGreen::callback->readReg32(0x70008); // PIPE_CONF_A
-		uint32_t pipeSrc   = NGreen::callback->readReg32(0x6001C); // PIPE_SRCSZ_A
+		uint32_t pipeSrc   = NGreen::callback->readReg32(_PIPEASRC);
 		// Plane 1 on Pipe A
 		uint32_t planCtl   = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		uint32_t planStrd  = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
@@ -11931,7 +11934,7 @@ IOReturn Gen11::fbGetPixelInformation(void *that, int mode, int depth, int apert
 			if (retry == kIOReturnSuccess) {
 				result = kIOReturnSuccess;
 			} else if (depth == 0 && callback != nullptr) {
-				const uint32_t src = NGreen::callback ? NGreen::callback->readReg32(0x6001C) : 0;
+				const uint32_t src = NGreen::callback ? NGreen::callback->readReg32(_PIPEASRC) : 0;
 				w = ((src >> 16) & 0x1FFFu) + 1u;
 				h = (src & 0x1FFFu) + 1u;
 				if (src != 0 && w >= 640u && w <= 8192u && h >= 480u && h <= 8192u) {
