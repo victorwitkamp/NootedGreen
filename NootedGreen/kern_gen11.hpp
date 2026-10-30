@@ -203,6 +203,16 @@ enum port { PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E };
 #define _TRANS_CLK_SEL_A		0x46140
 #define  TGL_TRANS_CLK_SEL_DISABLED	(0x0 << 28)
 #define  TGL_TRANS_CLK_SEL_PORT(x)	(((x) + 1) << 28)
+// DP_TP_CTL of a display-12 transcoder: i915's TGL_DP_TP_CTL(display, tran) is _MMIO_TRANS2(display, tran, _TGL_DP_TP_CTL_A), the
+// transcoders TRANSCODER_B_OFFSET - TRANSCODER_A_OFFSET apart (display/intel_display_device.c). IntelDPLinkTraining.hpp already names
+// the base TGL_DP_TP_CTL_A and the bit DP_TP_CTL_ENHANCED_FRAME_ENABLE, and holds TGL_DP_TP_CTL() for a per-port form, so the
+// per-transcoder form is written with _MMIO_TRANS2.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2560-L2573
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_reg_defs.h#L74
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_device.c#L96-L97
+#define TRANSCODER_A_OFFSET 0x60000
+#define TRANSCODER_B_OFFSET 0x61000
+#define _MMIO_TRANS2(trans, reg)	((reg) + (trans) * (TRANSCODER_B_OFFSET - TRANSCODER_A_OFFSET))
 #define GEN11_COMMON_SLICE_CHICKEN3		(0x7304)
 #define   GEN12_DISABLE_CPS_AWARE_COLOR_PIPE	(1 << 9)
 // Command Streamer chicken bits — GPU preemption granularity control

@@ -1375,9 +1375,10 @@ static void reflipIfStuck(void *surf, uint32_t fb, uint32_t n) {
 	gFlipCacheMs[idx] = uptimeMs();
 }
 
-static constexpr uint32_t kDpTpEnhancedFrame = 0x40000u;
-static constexpr uint32_t kDpTpCtlA      = 0x60540u;
-
+// From i915, drivers/gpu/drm/i915/display/intel_ddi.c, intel_ddi_prepare_link_retrain: an SST link with enhanced framing gets
+// DP_TP_CTL_ENHANCED_FRAME_ENABLE in DP_TP_CTL before training, with a posting read. i915 sets it once from the CRTC state; here it
+// is set after each pattern write of Apple's trainer, which never sets it (the sink's capability is in the DPCD Apple reads).
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L3814-L3844
 IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
 	const IOReturn ret = FunctionCast(wrapSetLinkTrainingPattern,
 	    callback->oSetLinkTrainingPattern)(that, pattern);
@@ -1386,10 +1387,10 @@ IOReturn Gen11::wrapSetLinkTrainingPattern(void *that, uint32_t pattern) {
 
 	const uint32_t trans = getMember<uint32_t>(that, 0x3640);
 	if (trans > 3u) return ret;
-	const uint32_t reg = kDpTpCtlA + (trans << 12);
-	const uint32_t pre = cb->readReg32(reg);
+	const uint32_t reg = _MMIO_TRANS2(trans, TGL_DP_TP_CTL_A);
+	const uint32_t dp_tp_ctl = cb->readReg32(reg);
 	if (!cb->mmioMapped()) return ret;
-	if ((pre & kDpTpEnhancedFrame) == 0) cb->writeReg32(reg, pre | kDpTpEnhancedFrame);
+	if ((dp_tp_ctl & DP_TP_CTL_ENHANCED_FRAME_ENABLE) == 0) cb->writeReg32(reg, dp_tp_ctl | DP_TP_CTL_ENHANCED_FRAME_ENABLE);
 	cb->readReg32(reg);
 	return ret;
 }
