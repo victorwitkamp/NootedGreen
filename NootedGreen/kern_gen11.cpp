@@ -1111,28 +1111,77 @@ static volatile uint32_t gBarrierArmed = 1u;
 
 static volatile uint32_t gHaveBiosRc6 = 0;
 static volatile uint32_t gBiosRc = 0, gBiosPg = 0;
+// From i915, drivers/gpu/drm/i915/intel_uncore.c: a forcewake domain (fw_domain_init: the request and ack registers of RENDER and GT
+// on gen 9+), fw_domain_get after fw_domain_wait_ack_clear, fw_domain_wait_ack_set for FORCEWAKE_ACK_TIMEOUT_MS, the fallback that toggles
+// FORCEWAKE_KERNEL_FALLBACK up to ten times when an ack does not come (fw_domain_wait_ack_with_fallback), and fw_domain_put. i915
+// requests with FORCEWAKE_KERNEL (bit 0); this driver's own requesters take bits of their own (4 for the engine probe, 5 for the RC6
+// writes) so that Apple's driver's requester bits (1 and 2) and its reference count are untouched.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/intel_uncore.c#L167-L322
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/intel_uncore.c#L2181-L2317
+struct intel_uncore_forcewake_domain { uint32_t reg_set, reg_ack; };
+static constexpr intel_uncore_forcewake_domain fw_domain_render = { FORCEWAKE_RENDER_GEN9, FORCEWAKE_ACK_RENDER_GEN9 };
+static constexpr intel_uncore_forcewake_domain fw_domain_gt     = { FORCEWAKE_GT_GEN9, FORCEWAKE_ACK_GT_GEN9 };
+static volatile uint32_t gFwFallbacks = 0;
+
+static inline uint32_t fw_ack(const intel_uncore_forcewake_domain &d) { return NGreen::callback->readReg32(d.reg_ack); }
+static inline void fw_set(const intel_uncore_forcewake_domain &d, uint32_t val) { NGreen::callback->writeReg32(d.reg_set, _MASKED_BIT_ENABLE(val)); }
+static inline void fw_clear(const intel_uncore_forcewake_domain &d, uint32_t val) { NGreen::callback->writeReg32(d.reg_set, _MASKED_BIT_DISABLE(val)); }
+
+static bool __wait_for_ack(const intel_uncore_forcewake_domain &d, uint32_t ack, uint32_t value) {
+	for (uint32_t us = 0; us < FORCEWAKE_ACK_TIMEOUT_MS * 1000u; us += 10u) {
+		if ((fw_ack(d) & ack) == value) return true;
+		IODelay(10);
+	}
+	return (fw_ack(d) & ack) == value;
+}
+static inline bool wait_ack_clear(const intel_uncore_forcewake_domain &d, uint32_t ack) { return __wait_for_ack(d, ack, 0); }
+static inline bool wait_ack_set(const intel_uncore_forcewake_domain &d, uint32_t ack) { return __wait_for_ack(d, ack, ack); }
+
+static bool fw_domain_wait_ack_with_fallback(const intel_uncore_forcewake_domain &d, uint32_t ack_bit, bool set) {
+	const uint32_t value = set ? ack_bit : 0;
+	unsigned int pass = 1;
+	bool ack_detected;
+
+	__sync_add_and_fetch(&gFwFallbacks, 1u);
+	do {
+		wait_ack_clear(d, FORCEWAKE_KERNEL_FALLBACK);
+		fw_set(d, FORCEWAKE_KERNEL_FALLBACK);
+		IODelay(10 * pass);
+		wait_ack_set(d, FORCEWAKE_KERNEL_FALLBACK);
+		ack_detected = (fw_ack(d) & ack_bit) == value;
+		fw_clear(d, FORCEWAKE_KERNEL_FALLBACK);
+	} while (!ack_detected && pass++ < 10);
+	return ack_detected;
+}
+
+static inline void fw_domain_wait_ack_clear_fallback(const intel_uncore_forcewake_domain &d, uint32_t bit) {
+	if (wait_ack_clear(d, bit)) return;
+	fw_domain_wait_ack_with_fallback(d, bit, false);
+}
+static inline bool fw_domain_wait_ack_set_fallback(const intel_uncore_forcewake_domain &d, uint32_t bit) {
+	if (wait_ack_set(d, bit)) return true;
+	return fw_domain_wait_ack_with_fallback(d, bit, true);
+}
+static inline void fw_domain_get(const intel_uncore_forcewake_domain &d, uint32_t bit) { fw_set(d, bit); }
+static inline void fw_domain_put(const intel_uncore_forcewake_domain &d, uint32_t bit) { fw_clear(d, bit); }
+
 static constexpr uint32_t kRc6FwBit = 1u << 5;
 static constexpr uint32_t kRc6AckNeed = 3u;
+// fw_domains_get_with_fallback for the RC6 requester on RENDER and GT; the acks as a mask (1 = render, 2 = gt).
 static uint32_t rc6FwGet() {
-	auto *cb = NGreen::callback;
-	const uint32_t req = (kRc6FwBit << 16) | kRc6FwBit, need = kRc6AckNeed;
-	cb->writeReg32(FORCEWAKE_RENDER_GEN9, req);
-	cb->writeReg32(FORCEWAKE_GT_GEN9, req);
+	fw_domain_wait_ack_clear_fallback(fw_domain_render, kRc6FwBit);
+	fw_domain_get(fw_domain_render, kRc6FwBit);
+	fw_domain_wait_ack_clear_fallback(fw_domain_gt, kRc6FwBit);
+	fw_domain_get(fw_domain_gt, kRc6FwBit);
 	uint32_t acks = 0;
-	for (int i = 0; i < 500 && (acks & need) != need; i++) {
-		acks = 0;
-		if (cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & kRc6FwBit) acks |= 1u;
-		if (cb->readReg32(FORCEWAKE_ACK_GT_GEN9) & kRc6FwBit) acks |= 2u;
-		if ((acks & need) != need) IODelay(10);
-	}
+	if (fw_domain_wait_ack_set_fallback(fw_domain_render, kRc6FwBit)) acks |= 1u;
+	if (fw_domain_wait_ack_set_fallback(fw_domain_gt, kRc6FwBit)) acks |= 2u;
 	return acks;
 }
 static inline bool rc6Acked(uint32_t acks) { return (acks & kRc6AckNeed) == kRc6AckNeed; }
 static void rc6FwPut() {
-	auto *cb = NGreen::callback;
-	const uint32_t clr = kRc6FwBit << 16;
-	cb->writeReg32(FORCEWAKE_RENDER_GEN9, clr);
-	cb->writeReg32(FORCEWAKE_GT_GEN9, clr);
+	fw_domain_put(fw_domain_render, kRc6FwBit);
+	fw_domain_put(fw_domain_gt, kRc6FwBit);
 }
 // From i915, drivers/gpu/drm/i915/gt/intel_rc6.c: of gen11_rc6_enable's rows only GEN9_RENDER_PG_ENABLE is applied here, on top of
 // the BIOS's GEN9_PG_ENABLE (mode 4, the render power gating the BIOS leaves off and Apple leaves to the absent GuC: A22's fix); the
@@ -1157,6 +1206,8 @@ static void applyRc6(uint32_t mode) {
 	if (mode & 2u) rc = 0;
 	if (rc6Acked(acks) && biosPg != pg) cb->writeReg32(GEN9_PG_ENABLE, pg);
 	if (rc6Acked(acks) && biosRc != rc) cb->writeReg32(GEN6_RC_CONTROL, rc);
+	SYSLOG("ngreen", "RC6: forcewake acks 0x%x (fallbacks %u), PG_ENABLE 0x%x -> 0x%x, RC_CONTROL 0x%x -> 0x%x",
+	       acks, gFwFallbacks, biosPg, cb->readReg32(GEN9_PG_ENABLE), biosRc, cb->readReg32(GEN6_RC_CONTROL));
 	rc6FwPut();
 }
 static void rc6ProbeTick() {
@@ -11369,11 +11420,9 @@ void Gen11::engineProbeTick(thread_call_param_t, thread_call_param_t) {
 		return;
 	}
 	auto *cb = NGreen::callback;
-	cb->writeReg32(FORCEWAKE_RENDER_GEN9, (kEngineProbeFwBit << 16) | kEngineProbeFwBit);
-	for (int i = 0; i < 50; i++) {
-		if (cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & kEngineProbeFwBit) break;
-		IODelay(10);
-	}
+	fw_domain_wait_ack_clear_fallback(fw_domain_render, kEngineProbeFwBit);
+	fw_domain_get(fw_domain_render, kEngineProbeFwBit);
+	fw_domain_wait_ack_set_fallback(fw_domain_render, kEngineProbeFwBit);
 	rc6ProbeTick();
 	const uint32_t index = ++gEngineProbeSamples;
 	const uint32_t execStatus = cb->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
@@ -11394,7 +11443,7 @@ void Gen11::engineProbeTick(thread_call_param_t, thread_call_param_t) {
 	if (csDebug != 0xffffffffu && ffMode != 0xffffffffu &&
 	    ((csDebug & FF_DOP_CLOCK_GATE_DISABLE) == 0 || (ffMode & GEN12_FF_TESSELATION_DOP_GATE_DISABLE) == 0))
 		applyRenderWa(cb, false);
-	cb->writeReg32(FORCEWAKE_RENDER_GEN9, (kEngineProbeFwBit << 16) | 0);
+	fw_domain_put(fw_domain_render, kEngineProbeFwBit);
 	rcsRetarget(hwsPgaPhys);
 	if (gBurstPrevExec != 0xffffffffu && gBurstLeft == 0) {
 		const bool wasRunning = (gBurstPrevExec & 0x18u) != 0 || gBurstPrevExec == 0x18001u;
