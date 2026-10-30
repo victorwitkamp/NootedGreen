@@ -414,6 +414,10 @@ enum port { PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E };
 #define GEN8_GGTT_PTE_BASE		0x800000
 #define GGTT_PTE_LO(page)		(GEN8_GGTT_PTE_BASE + (page) * 8)
 #define GGTT_PTE_HI(page)		(GEN8_GGTT_PTE_BASE + (page) * 8 + 4)
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gtt.h#L100
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gtt.h#L152
+#define GEN12_GGTT_PTE_ADDR_MASK	0x00003FFFFFFFF000ull	/* GENMASK_ULL(45, 12) */
+#define GEN8_PAGE_PRESENT		(1ull << 0)
 #define   GEN11_GFX_DISABLE_LEGACY_MODE		(1 << 3)
 #define   STOP_RING				REG_BIT(8)
 #define   MODE_IDLE				REG_BIT(9)

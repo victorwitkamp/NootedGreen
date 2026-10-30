@@ -261,14 +261,21 @@ static uint64_t pageWalk(uint64_t pml4, uint64_t va) {
 	}
 	return 0;
 }
+// From i915, drivers/gpu/drm/i915/gt/intel_ggtt.c, gen8_ggtt_pte_decode: a GGTT entry's address is its bits 45:12, its presence bit 0.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_ggtt.c#L293-L299
+static inline uint64_t gen8_ggtt_pte_decode(uint64_t pte, bool *is_present) {
+	*is_present = (pte & GEN8_PAGE_PRESENT) != 0;
+	return pte & GEN12_GGTT_PTE_ADDR_MASK;
+}
+
 static bool ringDw(NGreen *cb, uint32_t start, uint32_t off, uint32_t &out, uint32_t &cPage, uint64_t &cPa) {
 	const uint32_t ga = start + off;
 	const uint32_t page = ga >> 12;
 	if (page != cPage) {
-		const uint32_t lo = cb->readReg32(GGTT_PTE_LO(page));
-		const uint32_t hi = cb->readReg32(GGTT_PTE_HI(page));
-		if ((lo & 1u) == 0) return false;
-		cPa   = ((static_cast<uint64_t>(hi) << 32) | lo) & kL3AddrMask;
+		const uint64_t pte = (static_cast<uint64_t>(cb->readReg32(GGTT_PTE_HI(page))) << 32) | cb->readReg32(GGTT_PTE_LO(page));
+		bool is_present = false;
+		cPa = gen8_ggtt_pte_decode(pte, &is_present);
+		if (!is_present) return false;
 		cPage = page;
 	}
 	return readPhys32(cPa | (ga & 0xfffu), out);
@@ -11172,8 +11179,9 @@ void Gen11::engineProbeTick(thread_call_param_t, thread_call_param_t) {
 	if (hwsPga != 0 && hwsPga != 0xffffffffu) {
 		const uint32_t hwsPteLo = cb->readReg32(GGTT_PTE_LO(hwsPga >> 12));
 		const uint32_t hwsPteHi = cb->readReg32(GGTT_PTE_HI(hwsPga >> 12));
-		if ((hwsPteLo & 1) != 0)
-			hwsPgaPhys = (static_cast<uint64_t>(hwsPteHi & 0x000FFFFFu) << 32) | (hwsPteLo & 0xFFFFF000ull);
+		bool is_present = false;
+		const uint64_t pa = gen8_ggtt_pte_decode((static_cast<uint64_t>(hwsPteHi) << 32) | hwsPteLo, &is_present);
+		if (is_present) hwsPgaPhys = pa;
 	}
 	const uint32_t csDebug = cb->readReg32(GEN9_CS_DEBUG_MODE1);
 	const uint32_t ffMode = cb->readReg32(GEN7_FF_THREAD_MODE);
