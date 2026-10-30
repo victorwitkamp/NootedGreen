@@ -2,6 +2,7 @@
 //  details.
 #include "kern_gen11.hpp"
 #include "i915_lrc_reg.hpp"
+#include "drm_dp.hpp"
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -4662,25 +4663,33 @@ IOReturn Gen11::wrapICLWriteAUX(void *that, uint32_t address, void *buffer, uint
 
 	auto writeAUX = FunctionCast(wrapICLWriteAUX, callback->orgICLWriteAUX);
 
-	if (address == 0x010Au && length == 1 && buffer != nullptr && that != nullptr) {
+	// DP_EDP_CONFIGURATION_SET is written as 0 whatever Apple sends (i915 never writes this DPCD).
+	if (address == DP_EDP_CONFIGURATION_SET && length == 1 && buffer != nullptr && that != nullptr) {
 		uint8_t zero = 0;
-		return writeAUX(that, 0x010Au, &zero, 1u);
+		return writeAUX(that, DP_EDP_CONFIGURATION_SET, &zero, 1u);
 	}
 
 	const int32_t idx = RAPTOR_LAKE_HX_OR(4, -1);
 
-	if (idx >= 0 && address == 0x0100 && length == 2 && buffer != nullptr && that != nullptr) {
+	// From i915, drivers/gpu/drm/i915/display/intel_dp_link_training.c: Apple's two-byte DP_LINK_BW_SET write becomes
+	// intel_dp_link_training_set_bw's eDP 1.4 branch (DP_LANE_COUNT_SET, then DP_LINK_RATE_SET with the rate index, and no
+	// DP_LINK_BW_SET), after intel_dp_prepare_link_train's WaEdpLinkRateDataReload (a re-read of DP_SUPPORTED_LINK_RATES that the
+	// Parade MUX of TGL+ laptops needs to snoop). The lane byte is Apple's (i915 ORs the enhanced-framing bit in itself); the
+	// rate index is this panel's HBR3 entry (i915 takes it from intel_dp_compute_rate).
+	// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dp_link_training.c#L1154-L1183
+	// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dp_link_training.c#L1264-L1311
+	if (idx >= 0 && address == DP_LINK_BW_SET && length == 2 && buffer != nullptr && that != nullptr) {
 		auto *raw = reinterpret_cast<uint8_t *>(buffer);
-		uint8_t       lanes = raw[1];
-		uint8_t       rate  = static_cast<uint8_t>(idx);
+		uint8_t       lane_count  = raw[1];
+		uint8_t       rate_select = static_cast<uint8_t>(idx);
 
 		if (callback->orgICLReadAUX != 0) {
-			uint8_t rates[16] = {};
-			FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, 0x0010, rates, sizeof(rates));
+			uint16_t sink_rates[DP_MAX_SUPPORTED_RATES] = {};
+			FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, DP_SUPPORTED_LINK_RATES, sink_rates, sizeof(sink_rates));
 		}
 
-		const IOReturn rLane = writeAUX(that, 0x0101, &lanes, 1);
-		const IOReturn rRate = writeAUX(that, 0x0115, &rate, 1);
+		const IOReturn rLane = writeAUX(that, DP_LANE_COUNT_SET, &lane_count, 1);
+		const IOReturn rRate = writeAUX(that, DP_LINK_RATE_SET, &rate_select, 1);
 
 		return (rRate != kIOReturnSuccess) ? rRate : rLane;
 	}
