@@ -1063,18 +1063,29 @@ static void rc6FwPut() {
 	cb->writeReg32(FORCEWAKE_RENDER_GEN9, clr);
 	cb->writeReg32(FORCEWAKE_GT_GEN9, clr);
 }
+// From i915, drivers/gpu/drm/i915/gt/intel_rc6.c: of gen11_rc6_enable's rows only GEN9_RENDER_PG_ENABLE is applied here, on top of
+// the BIOS's GEN9_PG_ENABLE (mode 4, the render power gating the BIOS leaves off and Apple leaves to the absent GuC: A22's fix); the
+// thresholds and hysteresis, the media power-gating bits and GEN6_RC_CONTROL's RC6 enable stay the BIOS's and Apple's. Mode 2 is
+// __intel_rc6_disable's GEN6_RC_CONTROL = 0; mode 1 clears the render bit again. The registers: gt/intel_gt_regs.h.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_rc6.c#L61-L138
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_rc6.c#L559-L574
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L835
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L870-L875
+static constexpr uint32_t GEN6_RC_CONTROL       = 0xa090u;
+static constexpr uint32_t GEN9_PG_ENABLE        = 0xa210u;
+static constexpr uint32_t GEN9_RENDER_PG_ENABLE = 1u << 0;
 static void applyRc6(uint32_t mode) {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || !cb->mmioMapped()) return;
 	const uint32_t acks = rc6FwGet();
-	const uint32_t biosRc = cb->readReg32(0xa090u), biosPg = cb->readReg32(0xa210u);
+	const uint32_t biosRc = cb->readReg32(GEN6_RC_CONTROL), biosPg = cb->readReg32(GEN9_PG_ENABLE);
 	if (rc6Acked(acks) && __sync_bool_compare_and_swap(&gHaveBiosRc6, 0u, 1u)) { gBiosRc = biosRc; gBiosPg = biosPg; }
 	uint32_t rc = gHaveBiosRc6 ? gBiosRc : biosRc, pg = gHaveBiosRc6 ? gBiosPg : biosPg;
-	if (mode & 1u) pg &= ~1u;
-	if (mode & 4u) pg |= 1u;
+	if (mode & 1u) pg &= ~GEN9_RENDER_PG_ENABLE;
+	if (mode & 4u) pg |= GEN9_RENDER_PG_ENABLE;
 	if (mode & 2u) rc = 0;
-	if (rc6Acked(acks) && biosPg != pg) cb->writeReg32(0xa210u, pg);
-	if (rc6Acked(acks) && biosRc != rc) cb->writeReg32(0xa090u, rc);
+	if (rc6Acked(acks) && biosPg != pg) cb->writeReg32(GEN9_PG_ENABLE, pg);
+	if (rc6Acked(acks) && biosRc != rc) cb->writeReg32(GEN6_RC_CONTROL, rc);
 	rc6FwPut();
 }
 static void rc6ProbeTick() {
