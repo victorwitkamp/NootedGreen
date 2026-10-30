@@ -568,6 +568,11 @@ constexpr uint32_t GEN9_FREQUENCY_SHIFT = 23;
 constexpr uint32_t GEN9_FREQ_SCALER  = 3;
 // https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L777
 #define   GEN9_FREQUENCY(x)			((x) << GEN9_FREQUENCY_SHIFT)
+// From the kernel's include/drm/intel/i915_drm.h: the stolen-memory base of gen 11+ in PCI config space (BDSM, two dwords).
+// https://github.com/torvalds/linux/blob/65ba8f3/include/drm/intel/i915_drm.h#L97-L100
+#define INTEL_GEN11_BSM_DW0	0xc0
+#define INTEL_GEN11_BSM_DW1	0xc4
+#define   INTEL_BSM_MASK	(-(1u << 20))
 
 // ─── Forcewake ──────────────────────────────────────────────────────────────
 // Forcewake keeps GT power domains awake for MMIO access.

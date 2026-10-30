@@ -777,8 +777,9 @@ static void initStolenRange() {
 		ggttBase = static_cast<uint64_t>(g1 & 0xFFFFF000u) - 0x1000ull;
 	if ((ggttBase & 0xFFFFFull) != 0) ggttBase = 0;
 	uint32_t dw0 = 0, dw1 = 0;
-	if (cb->gpuDevice() != nullptr) { dw0 = cb->gpuDevice()->configRead32(0xC0); dw1 = cb->gpuDevice()->configRead32(0xC4); }
-	const uint64_t bdsm = (dw0 != 0 && dw0 != 0xFFFFFFFFu && dw1 == 0) ? (dw0 & 0xFFF00000ull) : 0;
+	// The BDSM register as the kernel's early-quirks stolen-base reader names it (include/drm/intel/i915_drm.h).
+	if (cb->gpuDevice() != nullptr) { dw0 = cb->gpuDevice()->configRead32(INTEL_GEN11_BSM_DW0); dw1 = cb->gpuDevice()->configRead32(INTEL_GEN11_BSM_DW1); }
+	const uint64_t bdsm = (dw0 != 0 && dw0 != 0xFFFFFFFFu && dw1 == 0) ? static_cast<uint64_t>(dw0 & INTEL_BSM_MASK) : 0;
 	uint64_t lo = ggttBase, hi = ggttBase != 0 ? ggttBase + size : 0;
 	if (bdsm != 0) {
 		if (lo == 0 || bdsm < lo) lo = bdsm;
