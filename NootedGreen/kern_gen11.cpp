@@ -182,6 +182,10 @@ static constexpr size_t   kCtxLrcBufOff   = 0x98;
 static constexpr size_t   kSharedBufVaOff = 0x38;
 static constexpr uint32_t kPoshSlot        = 0x35 + 1;
 
+// The state page of a render context opens with the LRI pairs i915 lays out in gen12_rcs_offsets (gt/intel_lrc.c): the register
+// of each pair names RING_CONTEXT_CONTROL, RING_TAIL and RING_START of the render engine (gt/intel_engine_regs.h), which is the
+// check applied before an image is touched.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_engine_regs.h#L12-L19
 static volatile uint32_t *lrcImageOf(void *ctx) {
 	if (ctx == nullptr) return nullptr;
 	auto *buf = *reinterpret_cast<void *volatile *>(
@@ -191,7 +195,7 @@ static volatile uint32_t *lrcImageOf(void *ctx) {
 	    static_cast<volatile uint8_t *>(buf) + kSharedBufVaOff);
 	if ((va >> 47) != 0x1ffffull || (va & 0xfffull) != 0) return nullptr;
 	auto *img = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(va) + LRC_STATE_OFFSET);
-	if (img[CTX_CONTEXT_CONTROL - 1] != 0x2244u || img[CTX_RING_TAIL - 1] != 0x2030u || img[CTX_RING_START - 1] != 0x2038u)
+	if (img[CTX_CONTEXT_CONTROL - 1] != RING_CONTEXT_CONTROL(RENDER_RING_BASE) || img[CTX_RING_TAIL - 1] != RING_TAIL(RENDER_RING_BASE) || img[CTX_RING_START - 1] != RING_START(RENDER_RING_BASE))
 		return nullptr;
 	return img;
 }
@@ -380,7 +384,7 @@ static void applySafeImageWa(void *ctx) {
 	const size_t len = md ? md->getLength() : 0;
 	if (bytes == nullptr || len < LRC_STATE_OFFSET + 0x1000u) return;
 	auto *img = reinterpret_cast<volatile uint32_t *>(const_cast<uint8_t *>(bytes) + LRC_STATE_OFFSET);
-	if (img[CTX_CONTEXT_CONTROL - 1] != 0x2244u || img[CTX_RING_TAIL - 1] != 0x2030u || img[CTX_RING_START - 1] != 0x2038u) return;
+	if (img[CTX_CONTEXT_CONTROL - 1] != RING_CONTEXT_CONTROL(RENDER_RING_BASE) || img[CTX_RING_TAIL - 1] != RING_TAIL(RENDER_RING_BASE) || img[CTX_RING_START - 1] != RING_START(RENDER_RING_BASE)) return;
 	patchImageWa(img, static_cast<uint32_t>((len - LRC_STATE_OFFSET) / 4u));
 }
 static void applyContextWa(NGreen *cb, void *ctx) {

@@ -353,6 +353,8 @@ enum port { PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E };
 #define RING_EIR(base)				((base) + 0xb0)
 #define RING_EMR(base)				((base) + 0xb4)
 #define RING_TAIL(base)				((base) + 0x30)
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_engine_regs.h#L181
+#define RING_CONTEXT_CONTROL(base)		((base) + 0x244)
 #define RING_HEAD(base)				((base) + 0x34)
 #define RING_HWS_PGA(base)			((base) + 0x80)
 #define RING_HWSTAM(base)			((base) + 0x98)
