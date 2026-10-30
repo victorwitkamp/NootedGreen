@@ -315,24 +315,30 @@ static void applyPoshContextControl(NGreen *cb, void *ctx) {
 	}
 }
 
-enum : uint32_t { kWaMasked = 0, kWaField = 1, kWaOr = 2, kWaWrite = 3 };
-struct ContextWa { uint32_t reg, kind, clr, set; const char *name; };
+// From i915, drivers/gpu/drm/i915/gt/intel_workarounds.c, gen12_ctx_workarounds_init: the context workarounds of a display-12 GT
+// (ADL-S is not DG1, so the HIZ_CHICKEN and COMMON_SLICE_CHICKEN4 rows apply), in its order; a row's kind is the helper it calls
+// there (wa_masked_en, wa_masked_field_set, wa_add with ~0 as the clear mask, wa_mcr_write_or). The last row is rcs_engine_wa_init's
+// ENABLE_SMALLPL, an engine workaround there, carried by the context image here as well. The registers: gt/intel_gt_regs.h.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_workarounds.c#L715-L778
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_workarounds.c#L301-L335
+enum : uint32_t { kWaMaskedEn = 0, kWaMaskedFieldSet = 1, kWaMcrWriteOr = 2, kWaAdd = 3 };
+struct i915_wa { uint32_t reg, kind, clr, set; const char *name; };
 static constexpr uint32_t kWaCount = 7;
-static const ContextWa kContextWa[kWaCount] = {
-	{0x7304u, kWaMasked, 0u,   1u << 9,     "CSC3"},
-	{0x2580u, kWaField,  0x6u, 0x2u,        "CSCHK1"},
-	{0x6604u, kWaWrite,  ~0u,  0xe0040000u, "FFMODE2"},
-	{0x7018u, kWaMasked, 0u,   1u << 13,    "HIZ"},
-	{0x7300u, kWaMasked, 0u,   1u << 6,     "CSC4"},
-	{0x5584u, kWaOr,     0u,   1u << 5,     "WMCHK2"},
-	{0xe18cu, kWaMasked, 0u,   1u << 15,    "SMP"},
+static const i915_wa kContextWa[kWaCount] = {
+	{GEN11_COMMON_SLICE_CHICKEN3, kWaMaskedEn,       0u,                            GEN12_DISABLE_CPS_AWARE_COLOR_PIPE,             "CSC3"},
+	{GEN8_CS_CHICKEN1,            kWaMaskedFieldSet, GEN9_PREEMPT_GPGPU_LEVEL_MASK, GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL,          "CSCHK1"},
+	{GEN12_FF_MODE2,              kWaAdd,            ~0u,                           FF_MODE2_TDS_TIMER_128 | FF_MODE2_GS_TIMER_224, "FFMODE2"},
+	{HIZ_CHICKEN,                 kWaMaskedEn,       0u,                            HZ_DEPTH_TEST_LE_GE_OPT_DISABLE,                "HIZ"},
+	{COMMON_SLICE_CHICKEN4,       kWaMaskedEn,       0u,                            DISABLE_TDC_LOAD_BALANCING_CALC,                "CSC4"},
+	{GEN8_WM_CHICKEN2,            kWaMcrWriteOr,     0u,                            WAIT_ON_DEPTH_STALL_DONE_DISABLE,               "WMCHK2"},
+	{GEN10_SAMPLER_MODE,          kWaMaskedEn,       0u,                            ENABLE_SMALLPL,                                 "SMP"},
 };
-static uint32_t waNewValue(const ContextWa &w, uint32_t old) {
+static uint32_t waNewValue(const i915_wa &w, uint32_t old) {
 	switch (w.kind) {
-	case kWaMasked: return old | w.set | (w.set << 16);
-	case kWaField:  return (old & ~w.clr) | w.set | (w.clr << 16);
-	case kWaOr:     return old | w.set;
-	default:          return w.set;
+	case kWaMaskedEn:       return old | w.set | (w.set << 16);
+	case kWaMaskedFieldSet: return (old & ~w.clr) | w.set | (w.clr << 16);
+	case kWaMcrWriteOr:     return old | w.set;
+	default:                return w.set;
 	}
 }
 static void patchImageWa(volatile uint32_t *base, uint32_t ndw) {
