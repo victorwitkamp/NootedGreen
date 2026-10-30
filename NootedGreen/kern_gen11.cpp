@@ -4359,8 +4359,6 @@ static void programDPLL0(uint8_t rateCode) {
 	       rateCode, port_clock, ref_clk, curC0, cfgcr0, curC1, cfgcr1, en, (en & PLL_POWER_STATE) != 0 ? 1u : 0u, (en & PLL_LOCK) != 0 ? 1u : 0u);
 }
 
-static constexpr uint32_t kPhyDpTpCtlA    = 0x60540u;
-static constexpr uint32_t kPhyDpTpStatusA = 0x60544u;
 
 
 static constexpr uint32_t kTxDw4UpperMask   = 0x7FFC0000u;
@@ -4428,30 +4426,33 @@ static volatile uint32_t gPhyTraining = 0;
 static volatile uint32_t gLinkRateCode = 0;	// the DP_LINK_BW_SET code of the training in progress (the loadgen rule's port clock)
 static volatile uint32_t gPhyProbed   = 0;
 
-static constexpr uint32_t kDpTpCtlLinkTrainMask = 0x7u << 8;
-static constexpr uint32_t kDpTpCtlLinkTrainIdle = 0x2u << 8;
-static constexpr uint32_t kDpTpStatusIdleDone   = 1u << 25;
+static constexpr uint32_t DP_TP_STATUS_IDLE_DONE = 1u << 25;
 
-static void dpclkaOneShot(void *that, AUXFn aux) {
+// From i915, drivers/gpu/drm/i915/display/intel_ddi.c, intel_ddi_set_idle_link_train: the idle pattern selected in DP_TP_CTL, then
+// DP_TP_STATUS's idle-done bit awaited for 2 ms (display 12 waits on port A too). The registers: IntelDPLinkTraining.hpp's names.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_ddi.c#L3878-L3903
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2587-L2591
+static void intel_ddi_set_idle_link_train() {
+	NGreen::callback->intel_de_rmw(TGL_DP_TP_CTL_A, DP_TP_CTL_LINK_TRAIN_MASK, DP_TP_CTL_LINK_TRAIN_IDLE);
+	intel_de_wait_ms(TGL_DP_TP_STATUS_A, DP_TP_STATUS_IDLE_DONE, true, 2);
+}
+
+// A probe at the first LANE0_1_STATUS read of a training: the sink's rate select and rate table are read, the link is put through one
+// idle-pattern period as intel_ddi_set_idle_link_train does, and the pattern Apple's trainer had selected is restored (i915 sends the
+// idle pattern only after a training; the restore is this probe's).
+static void linkTrainingIdleProbe(void *that, AUXFn aux) {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || !cb->mmioMapped()) return;
-	auto R = [cb](uint32_t reg) { return cb->readReg32(reg); };
-	auto W = [cb](uint32_t reg, uint32_t val) { cb->writeReg32(reg, val); (void)cb->readReg32(reg); };
 
 	uint8_t rs = 0xFF, tbl[16];
 	for (unsigned i = 0; i < sizeof(tbl); i++) tbl[i] = 0xFF;
-	aux(that, 0x0115, &rs, 1);
-	aux(that, 0x0010, tbl, sizeof(tbl));
+	aux(that, DP_LINK_RATE_SET, &rs, 1);
+	aux(that, DP_SUPPORTED_LINK_RATES, tbl, sizeof(tbl));
 
-	const uint32_t cur  = R(kPhyDpTpCtlA);
-	const uint32_t idle = (cur & ~kDpTpCtlLinkTrainMask) | kDpTpCtlLinkTrainIdle;
-	W(kPhyDpTpCtlA, idle);
-	for (int i = 0; i < 1000; i++) {
-		if ((R(kPhyDpTpStatusA) & kDpTpStatusIdleDone) != 0) break;
-		IODelay(1);
-	}
-	W(kPhyDpTpCtlA, cur);
-	R(kPhyDpTpStatusA);
+	const uint32_t cur = cb->readReg32(TGL_DP_TP_CTL_A);
+	intel_ddi_set_idle_link_train();
+	cb->writeReg32(TGL_DP_TP_CTL_A, cur);
+	(void)cb->readReg32(TGL_DP_TP_STATUS_A);
 }
 
 IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
@@ -4817,7 +4818,7 @@ IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint3
 		uint8_t sw[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 		readAUX(that, 0x0100, lc, sizeof(lc));
 		readAUX(that, 0x0103, sw, sizeof(sw));
-		dpclkaOneShot(that, readAUX);
+		linkTrainingIdleProbe(that, readAUX);
 	}
 
 	// V98T removed: do NOT clamp DPCD[0x0100-0x0101] (LINK_BW_SET / LANE_COUNT_SET).
