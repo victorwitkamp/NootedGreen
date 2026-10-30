@@ -1574,8 +1574,6 @@ static void armAgdcNub(void *controller, mach_vm_address_t org) {
 	if (notifier == nullptr) __sync_bool_compare_and_swap(&gAgdcNubState, kAgdcNubWaiting, kAgdcNubDone);
 }
 
-static constexpr uint32_t kSinkD3HoldMs = 20;
-static constexpr uint8_t kSourceOUI[3] = {0x00, 0xAA, 0x01};
 
 static bool ensureA788DisplayAWells(bool requireDDI = true);
 static void scanoutSnapshot(bool late) {
@@ -4455,20 +4453,55 @@ static void linkTrainingIdleProbe(void *that, AUXFn aux) {
 	(void)cb->readReg32(TGL_DP_TP_STATUS_A);
 }
 
+// From i915, drivers/gpu/drm/i915/display/intel_dp.c: intel_dp_init_source_oui (the source OUI read first and written only when it
+// differs, "so as to avoid clearing any state by accident") and intel_dp_set_power (D3 in one write; D0 after the OUI, retried three
+// times a millisecond apart "to give the sink time to wake up"). Each write here retries three times, as the DRM AUX helper retries.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dp.c#L3910-L3943
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_dp.c#L3965-L4008
+static IOReturn intel_dp_init_source_oui(void *that, AUXFn readAUX, AUXFn writeAUX, bool *written) {
+	uint8_t oui[] = { 0x00, 0xaa, 0x01 };
+	uint8_t buf[3] = {};
+
+	*written = false;
+	const IOReturn ret = readAUX(that, DP_SOURCE_OUI, buf, sizeof(buf));
+	if (ret != kIOReturnSuccess) return ret;
+	if (memcmp(oui, buf, sizeof(oui)) == 0) return kIOReturnSuccess;
+	*written = true;
+	return writeAUX(that, DP_SOURCE_OUI, oui, sizeof(oui));
+}
+
+static IOReturn intel_dp_set_power(void *that, AUXFn readAUX, AUXFn writeAUX, uint8_t mode, bool *oui_written) {
+	IOReturn ret = kIOReturnError;
+	if (mode != DP_SET_POWER_D0) {
+		for (int i = 0; i < 3; i++) {
+			ret = writeAUX(that, DP_SET_POWER, &mode, 1);
+			if (ret == kIOReturnSuccess) break;
+			IOSleep(1);
+		}
+	} else {
+		/* Write the source OUI as early as possible */
+		intel_dp_init_source_oui(that, readAUX, writeAUX, oui_written);
+		/*
+		 * When turning on, we need to retry for 1ms to give the sink
+		 * time to wake up.
+		 */
+		for (int i = 0; i < 3; i++) {
+			ret = writeAUX(that, DP_SET_POWER, &mode, 1);
+			if (ret == kIOReturnSuccess) break;
+			IOSleep(1);
+		}
+	}
+	return ret;
+}
+
 IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 	clearVdscGatePipeOff();
 	if (callback->orgICLReadAUX != 0 && gTGLFbBase != 0 && __sync_val_compare_and_swap(&gSinkPowerDone, 0u, 1u) == 0u) {
 		auto readAUX = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX);
 		auto writeAUX = reinterpret_cast<AUXFn>(gTGLFbBase + kWriteAUXOffset);
 		uint8_t value = 0xFF;
-		readAUX(that, 0x0600, &value, 1);
-		uint8_t d3 = 0x02;
-		for (uint32_t a = 0; a < 3; a++) {
-			if (writeAUX(that, 0x0600, &d3, 1) == kIOReturnSuccess) break;
-			IOSleep(1);
-		}
-		IOSleep(kSinkD3HoldMs);
-		readAUX(that, 0x0600, &value, 1);
+		// intel_ddi_post_disable's order: the sink to D3, then the panel off (the power cycle below); no hold between them.
+		const IOReturn d3ret = intel_dp_set_power(that, readAUX, writeAUX, DP_SET_POWER_D3, nullptr);
 		auto *cb = NGreen::callback;
 		if (cb != nullptr && cb->mmioMapped()) {
 			// From i915, drivers/gpu/drm/i915/display/intel_pps.c: one panel power cycle as intel_pps_off_unlocked and
@@ -4514,19 +4547,11 @@ IOReturn Gen11::wrapLinkTraining(void *that, void *config) {
 					for (uint32_t addr : kPpsSinkAddrs) readAUX(that, addr, &value, 1);
 			}
 		}
-		uint8_t oui[3] = {kSourceOUI[0], kSourceOUI[1], kSourceOUI[2]};
-		uint8_t readBack = 0xFF;
-		for (uint32_t i = 0; i < 3; i++) readAUX(that, 0x0300 + i, &readBack, 1);
-		if (writeAUX(that, 0x0300, oui, 3) != kIOReturnSuccess) {
-			for (uint32_t i = 0; i < 3; i++) writeAUX(that, 0x0300 + i, &oui[i], 1);
-		}
-		for (uint32_t i = 0; i < 3; i++) readAUX(that, 0x0300 + i, &readBack, 1);
-		uint8_t d0 = 0x01;
-		for (uint32_t a = 0; a < 3; a++) {
-			if (writeAUX(that, 0x0600, &d0, 1) == kIOReturnSuccess) break;
-			IOSleep(1);
-		}
-		readAUX(that, 0x0600, &value, 1);
+		// intel_ddi_pre_enable's order: the panel on (above), the source OUI, the sink to D0.
+		bool oui_written = false;
+		const IOReturn d0ret = intel_dp_set_power(that, readAUX, writeAUX, DP_SET_POWER_D0, &oui_written);
+		SYSLOG("ngreen", "sink power: D3 write 0x%x, the panel power cycle, source OUI %s, D0 write 0x%x",
+		       d3ret, oui_written ? "written" : "already set", d0ret);
 	}
 	auto *cb = NGreen::callback;
 	if (cb != nullptr && cb->mmioMapped()) {

@@ -11,4 +11,10 @@
 #define DP_EDP_CONFIGURATION_SET            0x10a   /* XXX 1.2? */
 #define DP_LINK_RATE_SET		    0x115   /* eDP 1.4 */
 
+#define DP_SOURCE_OUI			    0x300
+
+#define DP_SET_POWER                        0x600
+# define DP_SET_POWER_D0                    0x1
+# define DP_SET_POWER_D3                    0x2
+
 #endif
