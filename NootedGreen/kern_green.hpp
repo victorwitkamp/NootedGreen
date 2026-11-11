@@ -40,6 +40,9 @@ class EXPORT PRODUCT_NAME : public IOService {
 	bool start(IOService *provider) override;
 };*/
 
+//! The hardware model, detected from the CPU: the generations nothing else drives.
+enum struct HWModel { Unknown, TigerLake, RocketLake, AlderLakeS, AlderLakeP, RaptorLakeS, RaptorLakeP, RaptorLakeHX };
+
 class NGreen {
     friend class Gen11;
 	friend class Genx;
@@ -347,11 +350,12 @@ class NGreen {
     bool isGen9LPDerivative = false;
     bool isGen8LPDerivative = false;
     bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
+    HWModel hwModel = HWModel::Unknown;
 public:
 	uint64_t bootApertureLen() const { return apertureLen; }
 	IOPCIDevice *gpuDevice() const { return iGPU; }
     bool getIsRealTGL() const { return isRealTGL; }
-	bool isRaptorLakeHX() const { return deviceId == 0xA788; }
+	bool isRaptorLakeHX() const { return hwModel == HWModel::RaptorLakeHX; }
 private:
     bool dmcIsAdlp = false;    // true when ADL-P DMC blob was loaded in hwInitializeCState
 	bool dmcDisabled = false;

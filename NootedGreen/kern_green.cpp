@@ -330,7 +330,7 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 
         // V52: Detect real TGL vs spoofed RPL/ADL by CPU model
         // TGL-U: model 0x8C, TGL-H: model 0x8D
-        // RPL-P: model 0xBA, RPL-S: model 0xBF, RPL-HX: model 0xB7
+        // RPL-P: model 0xBA, RPL-S and RPL-HX: models 0xB7 and 0xBF
         // ADL-P: model 0x9A, ADL-S: model 0x97
         {
             uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
@@ -341,7 +341,23 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
             uint32_t stepping = eax & 0xF;
             if (family == 0x6) model |= (extModel << 4);
             this->cpuModel = model;
-            this->isRealTGL = (model == 0x8C || model == 0x8D);
+            // The model is the CPU's, not the iGPU's device-id: that one is spoofed to Tiger Lake's.
+            switch (model) {
+                case 0x8C: case 0x8D: this->hwModel = HWModel::TigerLake; break;
+                case 0xA7: this->hwModel = HWModel::RocketLake; break;
+                case 0x97: this->hwModel = HWModel::AlderLakeS; break;
+                case 0x9A: this->hwModel = HWModel::AlderLakeP; break;
+                case 0xBA: this->hwModel = HWModel::RaptorLakeP; break;
+                case 0xB7: case 0xBF: {
+                    // Desktop -S and mobile -HX are one die: only the brand string ("... i9-13980HX") tells them apart.
+                    uint32_t brand[13] = {};
+                    for (uint32_t i = 0; i < 3; i++)
+                        asm volatile("cpuid" : "=a"(brand[i * 4]), "=b"(brand[i * 4 + 1]), "=c"(brand[i * 4 + 2]), "=d"(brand[i * 4 + 3]) : "a"(0x80000002 + i));
+                    this->hwModel = strstr(reinterpret_cast<char *>(brand), "HX") ? HWModel::RaptorLakeHX : HWModel::RaptorLakeS;
+                    break;
+                }
+            }
+            this->isRealTGL = this->hwModel == HWModel::TigerLake;
             SYSLOG("ngreen", "V52: CPU family=0x%x model=0x%x stepping=%u isRealTGL=%d",
                    family, model, stepping, this->isRealTGL);
         }
